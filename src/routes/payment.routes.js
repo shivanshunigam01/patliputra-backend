@@ -40,7 +40,10 @@ const aadhaarUploadMiddleware = multer({
       "image/jpeg",
       "image/jpg",
     ].includes(file.mimetype);
-    cb(null, ok);
+    if (!ok) {
+      return cb(new Error("Aadhaar file must be PDF, PNG, or JPEG (max 5MB)."));
+    }
+    cb(null, true);
   },
 });
 
@@ -396,7 +399,7 @@ async function upsertPaymentOrder(order, precheckId = null) {
 async function commitCibilFromPrecheckSession(
   req,
   paymentDoc,
-  { razorpay_payment_id },
+  { razorpay_payment_id, aadhaar_number, aadhaar_document_url },
   session
 ) {
   await saveCibilResult({
@@ -406,6 +409,8 @@ async function commitCibilFromPrecheckSession(
     pan: session.pan,
     cibilScore: session.cibilScore,
     rawResponse: session.providerRaw || {},
+    aadhaarNumber: aadhaar_number || session.aadhaarNumber,
+    aadhaarDocumentUrl: aadhaar_document_url || null,
   });
 
   let experianLink = session.experianPdfLink;
@@ -480,12 +485,21 @@ async function commitCibilFromPrecheckSession(
 ========================= */
 router.post("/cibil-precheck", async (req, res) => {
   try {
-    const { name, mobile, pan, consent = "Y" } = req.body;
+    const { name, mobile, pan, aadhaar, aadhaar_number, consent = "Y" } =
+      req.body;
 
     if (!name || !mobile || !pan) {
       return res.status(400).json({
         ok: false,
         error: "name, mobile, and pan are required",
+      });
+    }
+
+    const aadhaar12 = normalizeAadhaar12(aadhaar ?? aadhaar_number);
+    if (!aadhaar12) {
+      return res.status(400).json({
+        ok: false,
+        error: "Valid 12-digit Aadhaar number is required.",
       });
     }
 
@@ -557,6 +571,7 @@ router.post("/cibil-precheck", async (req, res) => {
       name: name.trim(),
       mobile: mobileStr,
       pan: panStr,
+      aadhaarNumber: aadhaar12,
       cibilScore: surepassResult.cibilScore,
       reportNumber: surepassResult.reportNumber,
       reportDate: surepassResult.reportDate,
@@ -634,152 +649,232 @@ router.post("/razorpay/order", async (req, res) => {
 
 
 /* =========================
-   Step 2: Verify payment + fetch CIBIL JSON
+   Step 2: Verify payment + Aadhaar file (multipart) + CIBIL from precheck
 ========================= */
-router.post("/razorpay/verify-cibil", async (req, res) => {
+function unlinkUpload(filePath) {
   try {
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      precheck_id,
-      name,
-      mobile,
-      pan,
-    } = req.body;
-
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing Razorpay verification fields" });
-    }
-
-    if (!precheck_id) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Missing precheck_id. Verify your CIBIL details on the form before payment.",
-      });
-    }
-
-    if (!name || !mobile || !pan) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "name, mobile, and pan are required" });
-    }
-
-    const mobileStr = String(mobile).replace(/\D/g, "").slice(-10);
-    const panStr = String(pan).toUpperCase();
-
-    if (!/^\d{10}$/.test(mobileStr)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "mobile must be 10 digits" });
-    }
-
-    if (!/^[A-Z]{5}\d{4}[A-Z]$/.test(panStr)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "PAN format invalid (ABCDE1234F)" });
-    }
-
-    const signBody = `${razorpay_order_id}|${razorpay_payment_id}`;
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(signBody)
-      .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Invalid Razorpay signature" });
-    }
-
-    const payment = await Payment.findOne({ razorpay_order_id });
-    if (!payment) {
-      return res.status(400).json({
-        ok: false,
-        error: "Payment order not found. Create a new order and try again.",
-      });
-    }
-
-    const orderPrecheck = payment.metadata?.precheck_id;
-    if (!orderPrecheck || String(orderPrecheck) !== String(precheck_id).trim()) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "This payment does not match your verification. Go back, verify your details, and create a new payment.",
-      });
-    }
-
-    const session = await CibilPrecheckSession.findOne({
-      precheckId: String(precheck_id).trim(),
-      status: "ready",
-    });
-
-    if (!session) {
-      return res.status(400).json({
-        ok: false,
-        error: "Verification session invalid, expired, or already used.",
-      });
-    }
-
-    if (session.expiresAt < new Date()) {
-      return res.status(400).json({
-        ok: false,
-        error: "Verification expired. Please verify your details again.",
-      });
-    }
-
-    if (session.mobile !== mobileStr || session.pan !== panStr) {
-      return res.status(400).json({
-        ok: false,
-        error: "Name, mobile, or PAN do not match the pre-payment verification.",
-      });
-    }
-
-    if (normalizePersonName(session.name) !== normalizePersonName(name)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Name does not match the pre-payment verification.",
-      });
-    }
-
-    await Payment.updateOne(
-      { _id: payment._id },
-      {
-        $set: {
-          purpose: "cibil_check",
-          amount: 99,
-          currency: "INR",
-          razorpay_order_id,
-          razorpay_payment_id,
-          razorpay_signature,
-        },
-      }
-    );
-
-    const out = await commitCibilFromPrecheckSession(
-      req,
-      payment,
-      { razorpay_payment_id },
-      session
-    );
-
-    return res.json(out);
-  } catch (err) {
-    const ax = err && err.isAxiosError ? err : null;
-    const status = ax?.response?.status || 500;
-
-    console.error("verify-cibil fatal:", status, err?.message);
-
-    return res.status(status).json({
-      ok: false,
-      source: "server",
-      error: "Failed to verify payment or fetch CIBIL",
-    });
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (e) {
+    console.warn("unlinkUpload:", e?.message);
   }
-});
+}
+
+router.post(
+  "/razorpay/verify-cibil",
+  (req, res, next) => {
+    aadhaarUploadMiddleware.single("aadhaar_document")(req, res, (err) => {
+      if (err) {
+        if (err.code === "LIMIT_FILE_SIZE") {
+          return res.status(400).json({
+            ok: false,
+            error: "Aadhaar file must be 5MB or less.",
+          });
+        }
+        return res.status(400).json({
+          ok: false,
+          error: err.message || "Aadhaar file upload failed.",
+        });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    let uploadedPath = null;
+    try {
+      const {
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+        precheck_id,
+        name,
+        mobile,
+        pan,
+        aadhaar,
+        aadhaar_number: aadhaarNumberField,
+      } = req.body;
+
+      if (req.file) uploadedPath = req.file.path;
+
+      if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        unlinkUpload(uploadedPath);
+        return res
+          .status(400)
+          .json({ ok: false, error: "Missing Razorpay verification fields" });
+      }
+
+      if (!precheck_id) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Missing precheck_id. Verify your CIBIL details on the form before payment.",
+        });
+      }
+
+      if (!name || !mobile || !pan) {
+        unlinkUpload(uploadedPath);
+        return res
+          .status(400)
+          .json({ ok: false, error: "name, mobile, and pan are required" });
+      }
+
+      const aadhaar12 = normalizeAadhaar12(aadhaar ?? aadhaarNumberField);
+      if (!aadhaar12) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error: "Valid 12-digit Aadhaar number is required.",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          ok: false,
+          error: "Aadhaar document (PDF, PNG, or JPG) is required.",
+        });
+      }
+
+      const mobileStr = String(mobile).replace(/\D/g, "").slice(-10);
+      const panStr = String(pan).toUpperCase();
+
+      if (!/^\d{10}$/.test(mobileStr)) {
+        unlinkUpload(uploadedPath);
+        return res
+          .status(400)
+          .json({ ok: false, error: "mobile must be 10 digits" });
+      }
+
+      if (!/^[A-Z]{5}\d{4}[A-Z]$/.test(panStr)) {
+        unlinkUpload(uploadedPath);
+        return res
+          .status(400)
+          .json({ ok: false, error: "PAN format invalid (ABCDE1234F)" });
+      }
+
+      const signBody = `${razorpay_order_id}|${razorpay_payment_id}`;
+      const expectedSignature = crypto
+        .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+        .update(signBody)
+        .digest("hex");
+
+      if (expectedSignature !== razorpay_signature) {
+        unlinkUpload(uploadedPath);
+        return res
+          .status(400)
+          .json({ ok: false, error: "Invalid Razorpay signature" });
+      }
+
+      const payment = await Payment.findOne({ razorpay_order_id });
+      if (!payment) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error: "Payment order not found. Create a new order and try again.",
+        });
+      }
+
+      const orderPrecheck = payment.metadata?.precheck_id;
+      if (!orderPrecheck || String(orderPrecheck) !== String(precheck_id).trim()) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error:
+            "This payment does not match your verification. Go back, verify your details, and create a new payment.",
+        });
+      }
+
+      const session = await CibilPrecheckSession.findOne({
+        precheckId: String(precheck_id).trim(),
+        status: "ready",
+      });
+
+      if (!session) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error: "Verification session invalid, expired, or already used.",
+        });
+      }
+
+      if (session.expiresAt < new Date()) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error: "Verification expired. Please verify your details again.",
+        });
+      }
+
+      if (session.aadhaarNumber && session.aadhaarNumber !== aadhaar12) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error: "Aadhaar number does not match pre-payment verification.",
+        });
+      }
+
+      if (session.mobile !== mobileStr || session.pan !== panStr) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error: "Name, mobile, or PAN do not match the pre-payment verification.",
+        });
+      }
+
+      if (normalizePersonName(session.name) !== normalizePersonName(name)) {
+        unlinkUpload(uploadedPath);
+        return res.status(400).json({
+          ok: false,
+          error: "Name does not match the pre-payment verification.",
+        });
+      }
+
+      const aadhaarDocRel =
+        "/" +
+        path
+          .join("uploads", "cibil-aadhaar", path.basename(req.file.path))
+          .replace(/\\/g, "/");
+
+      await Payment.updateOne(
+        { _id: payment._id },
+        {
+          $set: {
+            purpose: "cibil_check",
+            amount: 99,
+            currency: "INR",
+            razorpay_order_id,
+            razorpay_payment_id,
+            razorpay_signature,
+          },
+        }
+      );
+
+      const out = await commitCibilFromPrecheckSession(
+        req,
+        payment,
+        {
+          razorpay_payment_id,
+          aadhaar_number: aadhaar12,
+          aadhaar_document_url: aadhaarDocRel,
+        },
+        session
+      );
+
+      return res.json(out);
+    } catch (err) {
+      unlinkUpload(req.file?.path);
+      const ax = err && err.isAxiosError ? err : null;
+      const status = ax?.response?.status || 500;
+
+      console.error("verify-cibil fatal:", status, err?.message);
+
+      return res.status(status).json({
+        ok: false,
+        source: "server",
+        error: "Failed to verify payment or fetch CIBIL",
+      });
+    }
+  }
+);
 
 router.post("/razorpay/retry-cibil", async (req, res) => {
   try {

@@ -152,6 +152,7 @@ export const listCibilChecks = asyncHandler(async (req, res) => {
       { customer_name: { $regex: s, $options: "i" } },
       { mobile: { $regex: s, $options: "i" } },
       { pan: { $regex: s, $options: "i" } },
+      { aadhaar_number: { $regex: s, $options: "i" } },
     ];
   }
   if (req.query.min_score || req.query.max_score) {
@@ -173,6 +174,8 @@ export const listCibilChecks = asyncHandler(async (req, res) => {
     mobile: c.mobile,
 
     panNumber: c.pan || c.pan_masked || "—",
+    aadhaarNumber: c.aadhaar_number || null,
+    aadhaarDocumentUrl: c.aadhaar_document_url || null,
     dateOfBirth: c.dob,
 
     score: c.cibil_score ?? 0,

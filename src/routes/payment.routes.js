@@ -1,10 +1,11 @@
 import express from "express";
 import Razorpay from "razorpay";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import axios from "axios";
 import { Payment } from "../models/Payment.js";
 import { CibilCheck } from "../models/CibilCheck.js";
-
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -42,6 +43,53 @@ const SUREPASS_PDF_ENDPOINT = new URL(
   "/api/v1/credit-report-experian/fetch-report-pdf",
   SUREPASS_BASE_URL
 ).toString();
+
+/* Local PDF storage (same style as product brochure: uploads/…) */
+const CIBIL_PDF_DIR = path.join(process.cwd(), "uploads", "cibil-reports");
+
+function ensureCibilPdfDir() {
+  if (!fs.existsSync(CIBIL_PDF_DIR)) {
+    fs.mkdirSync(CIBIL_PDF_DIR, { recursive: true });
+  }
+}
+
+/** @returns {Promise<string|null>} public path e.g. /uploads/cibil-reports/….pdf or null on failure */
+async function downloadExperianPdfToLocalDisk(sourceUrl) {
+  if (!sourceUrl || !String(sourceUrl).startsWith("http")) return null;
+  try {
+    ensureCibilPdfDir();
+    const spRes = await axios.get(String(sourceUrl), {
+      responseType: "arraybuffer",
+      maxContentLength: 25 * 1024 * 1024,
+      timeout: 120000,
+      validateStatus: (s) => s >= 200 && s < 300,
+    });
+    const name = `cibil_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.pdf`;
+    const filePath = path.join(CIBIL_PDF_DIR, name);
+    await fs.promises.writeFile(filePath, Buffer.from(spRes.data));
+    const publicPath = "/" + path.join("uploads", "cibil-reports", name).replace(/\\/g, "/");
+    return publicPath;
+  } catch (err) {
+    console.error("downloadExperianPdfToLocalDisk:", err?.message || err);
+    return null;
+  }
+}
+
+/** Browser-openable URL (brochure-style paths are relative to API host). */
+function publicFileAbsoluteUrl(req, publicPath) {
+  if (!publicPath) return publicPath;
+  if (/^https?:\/\//i.test(publicPath)) return publicPath;
+  const fromEnv = (process.env.API_PUBLIC_BASE_URL || process.env.SERVER_PUBLIC_URL || "")
+    .trim()
+    .replace(/\/$/, "");
+  if (fromEnv) return `${fromEnv}${publicPath.startsWith("/") ? publicPath : `/${publicPath}`}`;
+  const host = req.get("x-forwarded-host") || req.get("host");
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https")
+    .split(",")[0]
+    .trim();
+  const origin = `${proto}://${host}`.replace(/\/$/, "");
+  return `${origin}${publicPath.startsWith("/") ? publicPath : `/${publicPath}`}`;
+}
 
 /* =========================
    Razorpay instance
@@ -82,6 +130,23 @@ function maskPan(pan) {
   return `${panStr.slice(0, 2)}XXXX${panStr.slice(-2)}`;
 }
 
+async function updateLatestCibilPdfFields(mobileStr, panFull, fields) {
+  const panU = String(panFull).toUpperCase();
+  const legacyMask = maskPan(panU);
+  const $set = {};
+  if (fields.experian_pdf_link) $set.experian_pdf_link = fields.experian_pdf_link;
+  if (fields.cibil_pdf_report_url) $set.cibil_pdf_report_url = fields.cibil_pdf_report_url;
+  if (!Object.keys($set).length) return;
+  await CibilCheck.findOneAndUpdate(
+    {
+      mobile: mobileStr,
+      $or: [{ pan: panU }, { pan_masked: legacyMask }],
+    },
+    { $set },
+    { sort: { checked_at: -1 } }
+  );
+}
+
 async function saveCibilResult({
   paymentId,
   customerName,
@@ -90,10 +155,12 @@ async function saveCibilResult({
   cibilScore,
   rawResponse,
 }) {
+  const panU = String(pan).toUpperCase();
   const payload = {
     customer_name: customerName,
     mobile,
-    pan_masked: maskPan(pan),
+    pan: panU,
+    pan_masked: null,
     cibil_score: cibilScore,
     score_band: getScoreBand(cibilScore),
     raw_response: rawResponse || {},
@@ -476,52 +543,125 @@ router.post("/experian-pdf", async (req, res) => {
         .json({ ok: false, error: "name, mobile, and pan are required" });
     }
 
-    let spRes;
-    try {
-      spRes = await axios.post(
-        SUREPASS_PDF_ENDPOINT,
-        { name, consent, mobile, pan },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${SUREPASS_TOKEN}`,
-          },
-          timeout: 45000,
-          validateStatus: () => true,
-        }
-      );
-    } catch (networkErr) {
-      spRes = await axios.post(
-        SUREPASS_PDF_ENDPOINT,
-        { name, consent, mobile, pan },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${SUREPASS_TOKEN}`,
-          },
-          timeout: 45000,
-          validateStatus: () => true,
-        }
-      );
+    const mobileStr = String(mobile).replace(/\D/g, "").slice(-10);
+    const panStr = String(pan).toUpperCase();
+
+    if (!/^\d{10}$/.test(mobileStr)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "mobile must be 10 digits" });
     }
 
-    if (spRes.status < 200 || spRes.status >= 300) {
-      return res.status(502).json({
-        ok: false,
-        error: spRes.data?.message || "Surepass PDF API failed",
+    if (!/^[A-Z]{5}\d{4}[A-Z]$/.test(panStr)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "PAN format invalid (ABCDE1234F)" });
+    }
+
+    const panMasked = maskPan(panStr);
+
+    const latest = await CibilCheck.findOne({
+      mobile: mobileStr,
+      $or: [{ pan: panStr }, { pan_masked: panMasked }],
+    }).sort({ checked_at: -1 });
+
+    if (latest?.cibil_pdf_report_url) {
+      return res.json({
+        ok: true,
+        credit_report_link: publicFileAbsoluteUrl(
+          req,
+          latest.cibil_pdf_report_url
+        ),
+        cached: true,
       });
     }
 
-    const link =
-      spRes.data?.data?.credit_report_link ||
-      spRes.data?.data?.report_url ||
-      spRes.data?.credit_report_link;
+    let providerLink = latest?.experian_pdf_link || null;
 
-    if (!link) {
-      throw new Error("No PDF link found in Surepass response");
+    if (!providerLink) {
+      let spRes;
+      try {
+        spRes = await axios.post(
+          SUREPASS_PDF_ENDPOINT,
+          { name, consent: consent || "Y", mobile: mobileStr, pan: panStr },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${SUREPASS_TOKEN}`,
+            },
+            timeout: 45000,
+            validateStatus: () => true,
+          }
+        );
+      } catch {
+        spRes = await axios.post(
+          SUREPASS_PDF_ENDPOINT,
+          { name, consent: consent || "Y", mobile: mobileStr, pan: panStr },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${SUREPASS_TOKEN}`,
+            },
+            timeout: 45000,
+            validateStatus: () => true,
+          }
+        );
+      }
+
+      if (spRes.status < 200 || spRes.status >= 300) {
+        const msg =
+          spRes.data?.message ||
+          spRes.data?.error ||
+          "Surepass PDF API failed";
+        return res.status(502).json({
+          ok: false,
+          error: msg,
+          provider_status: spRes.status,
+        });
+      }
+
+      providerLink =
+        spRes.data?.data?.credit_report_link ||
+        spRes.data?.data?.report_url ||
+        spRes.data?.credit_report_link;
+
+      if (!providerLink) {
+        console.error(
+          "experian-pdf: no link in Surepass body",
+          JSON.stringify(spRes.data)?.slice(0, 500)
+        );
+        return res.status(502).json({
+          ok: false,
+          error:
+            spRes.data?.message ||
+            "No PDF link in provider response. Try again later.",
+        });
+      }
+
+      await updateLatestCibilPdfFields(mobileStr, panStr, {
+        experian_pdf_link: providerLink,
+      });
     }
 
-    return res.json({ ok: true, credit_report_link: link });
+    const storedPath = await downloadExperianPdfToLocalDisk(providerLink);
+    if (storedPath) {
+      await updateLatestCibilPdfFields(mobileStr, panStr, {
+        experian_pdf_link: providerLink,
+        cibil_pdf_report_url: storedPath,
+      });
+      return res.json({
+        ok: true,
+        credit_report_link: publicFileAbsoluteUrl(req, storedPath),
+        cached: false,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      credit_report_link: publicFileAbsoluteUrl(req, providerLink),
+      cached: false,
+      upload_note: "local_copy_unavailable",
+    });
   } catch (err) {
     console.error("experian-pdf error:", err?.response?.data || err.message);
     res.status(500).json({ ok: false, error: "Failed to fetch Experian PDF" });

@@ -113,12 +113,15 @@ export const verifyCibilPaymentAndCheck = asyncHandler(async (req, res) => {
     raw?.data?.cibil_score ??
     null;
 
-  const panMasked = String(payment.metadata?.pan || "").replace(/^(.{2}).*(.{2})$/, "$1******$2");
+  const panFull = String(payment.metadata?.pan || "")
+    .toUpperCase()
+    .replace(/\s/g, "");
 
   const check = await CibilCheck.create({
     customer_name: payment.customer_name,
     mobile: payment.mobile,
-    pan_masked: panMasked || undefined,
+    pan: panFull || undefined,
+    pan_masked: null,
     dob: payment.metadata?.dob,
     cibil_score: typeof score === "number" ? score : (score ? Number(score) : undefined),
     score_band: scoreBand(typeof score === "number" ? score : (score ? Number(score) : undefined)),
@@ -132,7 +135,7 @@ export const verifyCibilPaymentAndCheck = asyncHandler(async (req, res) => {
     id: check._id,
     customer_name: check.customer_name,
     mobile: check.mobile,
-    pan: check.pan_masked,
+    pan: check.pan || check.pan_masked,
     dob: check.dob,
     cibil_score: check.cibil_score,
     score_band: check.score_band,
@@ -144,9 +147,11 @@ export const verifyCibilPaymentAndCheck = asyncHandler(async (req, res) => {
 export const listCibilChecks = asyncHandler(async (req, res) => {
   const q = {};
   if (req.query.search) {
+    const s = String(req.query.search);
     q.$or = [
-      { customer_name: { $regex: String(req.query.search), $options: "i" } },
-      { mobile: { $regex: String(req.query.search), $options: "i" } },
+      { customer_name: { $regex: s, $options: "i" } },
+      { mobile: { $regex: s, $options: "i" } },
+      { pan: { $regex: s, $options: "i" } },
     ];
   }
   if (req.query.min_score || req.query.max_score) {
@@ -161,22 +166,23 @@ export const listCibilChecks = asyncHandler(async (req, res) => {
     CibilCheck.countDocuments(q),
   ]);
 
-  const mapped = items.map(c => ({
-  id: c._id.toString(),
+  const mapped = items.map((c) => ({
+    id: c._id.toString(),
 
-  customerName: c.customer_name,
-  mobile: c.mobile,
+    customerName: c.customer_name,
+    mobile: c.mobile,
 
-  panNumber: c.pan_masked,        // already masked
-  dateOfBirth: c.dob,
+    panNumber: c.pan || c.pan_masked || "—",
+    dateOfBirth: c.dob,
 
-  score: c.cibil_score ?? 0,
-  scoreBand: c.score_band
-    ? c.score_band.charAt(0).toUpperCase() + c.score_band.slice(1)
-    : "Unknown",
+    score: c.cibil_score ?? 0,
+    scoreBand: c.score_band
+      ? c.score_band.charAt(0).toUpperCase() + c.score_band.slice(1)
+      : "Unknown",
 
-  checkedAt: c.checked_at,
-}));
+    checkedAt: c.checked_at,
+    cibilPdfReportUrl: c.cibil_pdf_report_url || null,
+  }));
 
 return ok(res, mapped, { total, page, per_page });
 

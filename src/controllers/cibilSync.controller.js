@@ -21,21 +21,20 @@ export const syncCibilFromPayment = async (req, res) => {
       payment_id,
     } = req.body;
 
-    if (!customer_name || !mobile || !pan || !cibil_score) {
-      return erleich
-      res.status(400).json({
+    if (!customer_name || !mobile || !pan || cibil_score === undefined || cibil_score === null) {
+      return res.status(400).json({
         ok: false,
         error: "Missing required CIBIL data",
       });
     }
 
-    // Mask PAN
-    const pan_masked = pan.replace(/^(.{2}).*(.{2})$/, "$1******$2");
+    const panU = String(pan).toUpperCase().replace(/\s/g, "");
 
     const record = await CibilCheck.create({
       customer_name,
       mobile,
-      pan_masked,
+      pan: panU,
+      pan_masked: null,
       dob: dob || null,
       cibil_score,
       score_band: scoreBand(cibil_score),

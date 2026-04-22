@@ -167,7 +167,7 @@ async function upsertPaymentOrder(order) {
 }
 
 /* =========================
-   Step 1: Create Razorpay order (₹1)
+   Step 1: Create Razorpay order (₹99)
 ========================= */
 router.post("/razorpay/order", async (req, res) => {
   try {
@@ -175,7 +175,7 @@ router.post("/razorpay/order", async (req, res) => {
     const razor = getRazorpayInstance();
 
     const order = await razor.orders.create({
-      amount: 1 * 100,
+      amount: 99 * 100,
       currency: "INR",
       receipt: `cibil_${Date.now()}`,
     });
@@ -258,7 +258,7 @@ router.post("/razorpay/verify-cibil", async (req, res) => {
       {
         $set: {
           purpose: "cibil_check",
-          amount: 1,
+          amount: 99,
           currency: "INR",
           razorpay_order_id,
           razorpay_payment_id,

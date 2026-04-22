@@ -7,11 +7,47 @@ import axios from "axios";
 import { Payment } from "../models/Payment.js";
 import { CibilCheck } from "../models/CibilCheck.js";
 import { CibilPrecheckSession } from "../models/CibilPrecheckSession.js";
+import multer from "multer";
 
 import dotenv from "dotenv";
 dotenv.config();
 
 const router = express.Router();
+
+const AADHAAR_UPLOAD_DIR = path.join(process.cwd(), "uploads", "cibil-aadhaar");
+if (!fs.existsSync(AADHAAR_UPLOAD_DIR)) {
+  fs.mkdirSync(AADHAAR_UPLOAD_DIR, { recursive: true });
+}
+
+const aadhaarStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, AADHAAR_UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname) || ".pdf";
+    cb(
+      null,
+      `aadhaar_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`
+    );
+  },
+});
+
+const aadhaarUploadMiddleware = multer({
+  storage: aadhaarStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = [
+      "application/pdf",
+      "image/png",
+      "image/jpeg",
+      "image/jpg",
+    ].includes(file.mimetype);
+    cb(null, ok);
+  },
+});
+
+function normalizeAadhaar12(value) {
+  const d = String(value || "").replace(/\D/g, "");
+  return d.length === 12 ? d : null;
+}
 
 router.get("/ping", (req, res) => {
   res.json({ ok: true, msg: "payment route alive" });
@@ -155,6 +191,8 @@ async function saveCibilResult({
   pan,
   cibilScore,
   rawResponse,
+  aadhaarNumber = null,
+  aadhaarDocumentUrl = null,
 }) {
   const panU = String(pan).toUpperCase();
   const payload = {
@@ -167,6 +205,8 @@ async function saveCibilResult({
     raw_response: rawResponse || {},
     payment_id: paymentId,
   };
+  if (aadhaarNumber) payload.aadhaar_number = aadhaarNumber;
+  if (aadhaarDocumentUrl) payload.aadhaar_document_url = aadhaarDocumentUrl;
 
   await CibilCheck.findOneAndUpdate({ payment_id: paymentId }, payload, {
     upsert: true,

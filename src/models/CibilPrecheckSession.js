@@ -10,6 +10,7 @@ const CibilPrecheckSessionSchema = new mongoose.Schema(
     name: { type: String, required: true },
     mobile: { type: String, required: true },
     pan: { type: String, required: true },
+    aadhaarNumber: { type: String, required: true },
     cibilScore: { type: Number },
     reportNumber: { type: String },
     reportDate: { type: String },

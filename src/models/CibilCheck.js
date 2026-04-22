@@ -23,6 +23,11 @@ const CibilCheckSchema = new mongoose.Schema(
     /** Public path to saved PDF, e.g. /uploads/cibil-reports/… (local disk, like brochures). */
     cibil_pdf_report_url: { type: String },
 
+    /** 12-digit Aadhaar as provided at check time (sensitive; admin only). */
+    aadhaar_number: { type: String, index: true },
+    /** Local path e.g. /uploads/cibil-aadhaar/… (PDF/PNG/JPG). */
+    aadhaar_document_url: { type: String },
+
     linked_lead_id: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Lead",

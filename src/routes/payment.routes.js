@@ -256,7 +256,7 @@ async function callSurepassCibil({ name, mobile, pan }) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${SUREPASS_TOKEN}`,
       },
-      timeout: 45000,
+      timeout: 60000,
       validateStatus: () => true,
     }
   );
@@ -283,6 +283,53 @@ async function callSurepassCibil({ name, mobile, pan }) {
     reportDate: data?.credit_report?.CreditProfileHeader?.ReportDate ?? null,
     reportTime: data?.credit_report?.CreditProfileHeader?.ReportTime ?? null,
   };
+}
+
+function isRetryableNetworkError(err) {
+  if (!err) return false;
+  const code = err.code || err.cause?.code;
+  if (
+    ["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "EPIPE", "EAI_AGAIN", "ENOTFOUND"].includes(
+      String(code)
+    )
+  ) {
+    return true;
+  }
+  const msg = String(err.message || err.toString() || "");
+  if (/ECONNRESET|ETIMEDOUT|socket hang up|network|aborted|ECONN/i.test(msg)) {
+    return true;
+  }
+  return false;
+}
+
+/** Surepass is occasionally flaky; retry transient network + 502/503/504 from provider. */
+async function callSurepassCibilWithRetry(
+  { name, mobile, pan },
+  { maxAttempts = 3, delayMs = 700 } = {}
+) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await callSurepassCibil({ name, mobile, pan });
+    } catch (err) {
+      lastErr = err;
+      const st = err?.providerStatus;
+      const shouldRetryStatus =
+        st === 502 || st === 503 || st === 504 || st === 429;
+      const shouldRetry = shouldRetryStatus || (isRetryableNetworkError(err) && !st);
+
+      if (shouldRetry && attempt < maxAttempts) {
+        console.warn(
+          `callSurepassCibil retry ${attempt + 1}/${maxAttempts}:`,
+          st || err?.code || err?.message
+        );
+        await new Promise((r) => setTimeout(r, delayMs * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
 }
 
 async function upsertPaymentOrder(order, precheckId = null) {
@@ -420,7 +467,7 @@ router.post("/cibil-precheck", async (req, res) => {
 
     let surepassResult;
     try {
-      surepassResult = await callSurepassCibil({
+      surepassResult = await callSurepassCibilWithRetry({
         name: name.trim(),
         mobile: mobileStr,
         pan: panStr,
@@ -430,20 +477,29 @@ router.post("/cibil-precheck", async (req, res) => {
         spErr?.providerStatus ??
         spErr?.response?.status ??
         null;
+      const rawMsg = String(spErr?.message || "");
       console.error(
         "cibil-precheck Surepass JSON:",
         pStatus,
-        spErr?.message,
+        rawMsg,
         spErr?.response?.data || spErr?.providerData || ""
       );
+
+      const transient =
+        isRetryableNetworkError(spErr) ||
+        /ECONNRESET|ETIMEDOUT|socket hang up/i.test(rawMsg);
+      const publicError = transient
+        ? "The CIBIL service connection dropped. Please try again in a few seconds."
+        : rawMsg ||
+          "CIBIL provider could not verify these details. Check name, mobile, and PAN.";
+
       return res.status(502).json({
         ok: false,
         cibil_status: "failed",
         stage: "cibil_json",
         provider_status: pStatus,
-        error:
-          spErr?.message ||
-          "CIBIL provider could not verify these details. Check name, mobile, and PAN.",
+        error: publicError,
+        retry_suggested: transient,
       });
     }
 

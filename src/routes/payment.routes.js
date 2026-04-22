@@ -6,6 +6,7 @@ import path from "path";
 import axios from "axios";
 import { Payment } from "../models/Payment.js";
 import { CibilCheck } from "../models/CibilCheck.js";
+import { CibilPrecheckSession } from "../models/CibilPrecheckSession.js";
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -174,6 +175,73 @@ async function saveCibilResult({
   });
 }
 
+const PRECHECK_TTL_MS = 30 * 60 * 1000;
+
+function normalizePersonName(n) {
+  return String(n || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+/**
+ * Fetches temporary Experian PDF URL from Surepass (not saved to CibilCheck here).
+ * @returns {{ ok: true, link: string } | { ok: false, status: number, error: string }}
+ */
+async function fetchExperianPdfLinkFromSurepass({
+  name,
+  mobileStr,
+  panStr,
+  consent = "Y",
+}) {
+  let spRes;
+  try {
+    spRes = await axios.post(
+      SUREPASS_PDF_ENDPOINT,
+      { name, consent: consent || "Y", mobile: mobileStr, pan: panStr },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${SUREPASS_TOKEN}`,
+        },
+        timeout: 45000,
+        validateStatus: () => true,
+      }
+    );
+  } catch {
+    spRes = await axios.post(
+      SUREPASS_PDF_ENDPOINT,
+      { name, consent: consent || "Y", mobile: mobileStr, pan: panStr },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${SUREPASS_TOKEN}`,
+        },
+        timeout: 45000,
+        validateStatus: () => true,
+      }
+    );
+  }
+
+  if (spRes.status < 200 || spRes.status >= 300) {
+    return {
+      ok: false,
+      status: spRes.status,
+      error: spRes.data?.message || spRes.data?.error || "Surepass PDF API failed",
+    };
+  }
+
+  const link =
+    spRes.data?.data?.credit_report_link ||
+    spRes.data?.data?.report_url ||
+    spRes.data?.credit_report_link;
+
+  if (!link) {
+    return { ok: false, status: 502, error: "No PDF link in provider response" };
+  }
+  return { ok: true, link };
+}
+
 async function callSurepassCibil({ name, mobile, pan }) {
   const spRes = await axios.post(
     SUREPASS_JSON_ENDPOINT,
@@ -217,28 +285,213 @@ async function callSurepassCibil({ name, mobile, pan }) {
   };
 }
 
-async function upsertPaymentOrder(order) {
+async function upsertPaymentOrder(order, precheckId = null) {
+  const setOnInsert = {
+    purpose: "cibil_check",
+    amount: order.amount / 100,
+    currency: order.currency,
+    razorpay_order_id: order.id,
+    status: "created",
+  };
+  if (precheckId) {
+    setOnInsert.metadata = { precheck_id: precheckId };
+  }
   await Payment.findOneAndUpdate(
     { razorpay_order_id: order.id },
-    {
-      $setOnInsert: {
-        purpose: "cibil_check",
-        amount: order.amount / 100,
-        currency: order.currency,
-        razorpay_order_id: order.id,
-        status: "created",
-      },
-    },
+    { $setOnInsert: setOnInsert },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
 }
+
+/**
+ * After payment, persist CIBIL + PDF from a completed precheck session (no second Surepass call).
+ */
+async function commitCibilFromPrecheckSession(
+  req,
+  paymentDoc,
+  { razorpay_payment_id },
+  session
+) {
+  await saveCibilResult({
+    paymentId: razorpay_payment_id,
+    customerName: session.name,
+    mobile: session.mobile,
+    pan: session.pan,
+    cibilScore: session.cibilScore,
+    rawResponse: session.providerRaw || {},
+  });
+
+  let creditReportUrl = null;
+  if (session.experianPdfLink) {
+    const storedPath = await downloadExperianPdfToLocalDisk(session.experianPdfLink);
+    if (storedPath) {
+      await updateLatestCibilPdfFields(session.mobile, session.pan, {
+        experian_pdf_link: session.experianPdfLink,
+        cibil_pdf_report_url: storedPath,
+      });
+      creditReportUrl = publicFileAbsoluteUrl(req, storedPath);
+    } else {
+      await updateLatestCibilPdfFields(session.mobile, session.pan, {
+        experian_pdf_link: session.experianPdfLink,
+      });
+      creditReportUrl = publicFileAbsoluteUrl(req, session.experianPdfLink);
+    }
+  }
+
+  await CibilPrecheckSession.updateOne(
+    { _id: session._id },
+    { $set: { status: "consumed" } }
+  );
+
+  await Payment.updateOne(
+    { _id: paymentDoc._id },
+    {
+      $set: {
+        status: "paid",
+        customer_name: session.name,
+        mobile: session.mobile,
+        "metadata.pan": session.pan,
+        "metadata.cibil_status": "success",
+        "metadata.cibil_last_error": null,
+        "metadata.cibil_last_attempt_at": new Date(),
+      },
+    }
+  );
+
+  return {
+    ok: true,
+    score: session.cibilScore,
+    report_number: session.reportNumber,
+    report_date: session.reportDate,
+    report_time: session.reportTime,
+    raw: session.providerRaw,
+    credit_report_link: creditReportUrl,
+  };
+}
+
+/* =========================
+   Step 0: Pre-check (Surepass CIBIL + PDF) — must succeed before payment
+========================= */
+router.post("/cibil-precheck", async (req, res) => {
+  try {
+    const { name, mobile, pan, consent = "Y" } = req.body;
+
+    if (!name || !mobile || !pan) {
+      return res.status(400).json({
+        ok: false,
+        error: "name, mobile, and pan are required",
+      });
+    }
+
+    const mobileStr = String(mobile).replace(/\D/g, "").slice(-10);
+    const panStr = String(pan).toUpperCase();
+
+    if (!/^\d{10}$/.test(mobileStr)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "mobile must be 10 digits" });
+    }
+
+    if (!/^[A-Z]{5}\d{4}[A-Z]$/.test(panStr)) {
+      return res.status(400).json({
+        ok: false,
+        error: "PAN format invalid (ABCDE1234F)",
+      });
+    }
+
+    let surepassResult;
+    try {
+      surepassResult = await callSurepassCibil({
+        name: name.trim(),
+        mobile: mobileStr,
+        pan: panStr,
+      });
+    } catch (spErr) {
+      return res.status(502).json({
+        ok: false,
+        cibil_status: "failed",
+        error:
+          spErr?.message ||
+          "CIBIL provider could not verify these details. Check name, mobile, and PAN.",
+      });
+    }
+
+    const pdfRes = await fetchExperianPdfLinkFromSurepass({
+      name: name.trim(),
+      mobileStr,
+      panStr,
+      consent,
+    });
+
+    if (!pdfRes.ok) {
+      return res.status(502).json({
+        ok: false,
+        cibil_status: "pdf_failed",
+        error:
+          pdfRes.error || "CIBIL PDF could not be generated. Please try again.",
+      });
+    }
+
+    const precheckId = crypto.randomBytes(24).toString("hex");
+    const expiresAt = new Date(Date.now() + PRECHECK_TTL_MS);
+
+    await CibilPrecheckSession.create({
+      precheckId,
+      name: name.trim(),
+      mobile: mobileStr,
+      pan: panStr,
+      cibilScore: surepassResult.cibilScore,
+      reportNumber: surepassResult.reportNumber,
+      reportDate: surepassResult.reportDate,
+      reportTime: surepassResult.reportTime,
+      providerRaw: surepassResult.providerRaw,
+      experianPdfLink: pdfRes.link,
+      status: "ready",
+      expiresAt,
+    });
+
+    return res.json({
+      ok: true,
+      precheck_id: precheckId,
+      expires_in_seconds: Math.floor(PRECHECK_TTL_MS / 1000),
+      message: "Details verified. Proceed to payment to view your score and report.",
+    });
+  } catch (err) {
+    console.error("cibil-precheck error:", err?.message);
+    return res.status(500).json({ ok: false, error: "Pre-check failed" });
+  }
+});
 
 /* =========================
    Step 1: Create Razorpay order (₹99)
 ========================= */
 router.post("/razorpay/order", async (req, res) => {
   try {
-    // ✅ CREATE INSTANCE HERE (lazy init)
+    const { precheck_id: precheckId } = req.body || {};
+
+    if (!precheckId) {
+      return res.status(400).json({
+        error:
+          "Complete CIBIL verification on the form first, then proceed to payment.",
+      });
+    }
+
+    const session = await CibilPrecheckSession.findOne({
+      precheckId: String(precheckId).trim(),
+      status: "ready",
+    });
+    if (!session) {
+      return res.status(400).json({
+        error:
+          "Invalid or expired verification. Please verify your details again before payment.",
+      });
+    }
+    if (session.expiresAt < new Date()) {
+      return res.status(400).json({
+        error: "Verification expired. Please verify your details again.",
+      });
+    }
+
     const razor = getRazorpayInstance();
 
     const order = await razor.orders.create({
@@ -246,7 +499,7 @@ router.post("/razorpay/order", async (req, res) => {
       currency: "INR",
       receipt: `cibil_${Date.now()}`,
     });
-    await upsertPaymentOrder(order);
+    await upsertPaymentOrder(order, precheckId);
 
     res.json({
       id: order.id,
@@ -270,18 +523,24 @@ router.post("/razorpay/verify-cibil", async (req, res) => {
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
+      precheck_id,
       name,
       mobile,
       pan,
     } = req.body;
 
-    /* =========================
-       Basic validations
-    ========================= */
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res
         .status(400)
         .json({ ok: false, error: "Missing Razorpay verification fields" });
+    }
+
+    if (!precheck_id) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Missing precheck_id. Verify your CIBIL details on the form before payment.",
+      });
     }
 
     if (!name || !mobile || !pan) {
@@ -290,7 +549,7 @@ router.post("/razorpay/verify-cibil", async (req, res) => {
         .json({ ok: false, error: "name, mobile, and pan are required" });
     }
 
-    const mobileStr = String(mobile);
+    const mobileStr = String(mobile).replace(/\D/g, "").slice(-10);
     const panStr = String(pan).toUpperCase();
 
     if (!/^\d{10}$/.test(mobileStr)) {
@@ -305,13 +564,10 @@ router.post("/razorpay/verify-cibil", async (req, res) => {
         .json({ ok: false, error: "PAN format invalid (ABCDE1234F)" });
     }
 
-    /* =========================
-       Verify Razorpay signature
-    ========================= */
-    const body = `${razorpay_order_id}|${razorpay_payment_id}`;
+    const signBody = `${razorpay_order_id}|${razorpay_payment_id}`;
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(body)
+      .update(signBody)
       .digest("hex");
 
     if (expectedSignature !== razorpay_signature) {
@@ -320,8 +576,58 @@ router.post("/razorpay/verify-cibil", async (req, res) => {
         .json({ ok: false, error: "Invalid Razorpay signature" });
     }
 
-    const paymentDoc = await Payment.findOneAndUpdate(
-      { razorpay_order_id },
+    const payment = await Payment.findOne({ razorpay_order_id });
+    if (!payment) {
+      return res.status(400).json({
+        ok: false,
+        error: "Payment order not found. Create a new order and try again.",
+      });
+    }
+
+    const orderPrecheck = payment.metadata?.precheck_id;
+    if (!orderPrecheck || String(orderPrecheck) !== String(precheck_id).trim()) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "This payment does not match your verification. Go back, verify your details, and create a new payment.",
+      });
+    }
+
+    const session = await CibilPrecheckSession.findOne({
+      precheckId: String(precheck_id).trim(),
+      status: "ready",
+    });
+
+    if (!session) {
+      return res.status(400).json({
+        ok: false,
+        error: "Verification session invalid, expired, or already used.",
+      });
+    }
+
+    if (session.expiresAt < new Date()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Verification expired. Please verify your details again.",
+      });
+    }
+
+    if (session.mobile !== mobileStr || session.pan !== panStr) {
+      return res.status(400).json({
+        ok: false,
+        error: "Name, mobile, or PAN do not match the pre-payment verification.",
+      });
+    }
+
+    if (normalizePersonName(session.name) !== normalizePersonName(name)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Name does not match the pre-payment verification.",
+      });
+    }
+
+    await Payment.updateOne(
+      { _id: payment._id },
       {
         $set: {
           purpose: "cibil_check",
@@ -330,82 +636,18 @@ router.post("/razorpay/verify-cibil", async (req, res) => {
           razorpay_order_id,
           razorpay_payment_id,
           razorpay_signature,
-          status: "paid_pending",
-          customer_name: name,
-          mobile: mobileStr,
-          metadata: {
-            pan: panStr,
-            cibil_status: "pending",
-            cibil_last_error: null,
-            cibil_last_attempt_at: new Date(),
-          },
-        },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-
-    let surepassResult;
-    try {
-      surepassResult = await callSurepassCibil({ name, mobile: mobileStr, pan: panStr });
-    } catch (spErr) {
-      await Payment.updateOne(
-        { _id: paymentDoc._id },
-        {
-          $set: {
-            status: "paid_pending",
-            "metadata.cibil_status": "pending",
-            "metadata.cibil_last_attempt_at": new Date(),
-            "metadata.cibil_last_error": {
-              message: spErr?.message || "Surepass error",
-              status: spErr?.providerStatus || null,
-            },
-          },
-        }
-      );
-
-      return res.status(202).json({
-        ok: true,
-        payment_verified: true,
-        cibil_status: "pending",
-        message:
-          "Payment succeeded but CIBIL provider is temporarily unavailable. Retry shortly.",
-        razorpay_order_id,
-        razorpay_payment_id,
-      });
-    }
-
-    await saveCibilResult({
-      paymentId: razorpay_payment_id,
-      customerName: name,
-      mobile: mobileStr,
-      pan: panStr,
-      cibilScore: surepassResult.cibilScore,
-      rawResponse: surepassResult.providerRaw,
-    });
-
-    await Payment.updateOne(
-      { _id: paymentDoc._id },
-      {
-        $set: {
-          status: "paid",
-          "metadata.cibil_status": "success",
-          "metadata.cibil_last_error": null,
-          "metadata.cibil_last_attempt_at": new Date(),
         },
       }
     );
 
-    /* =========================
-       Final response to frontend
-    ========================= */
-    return res.json({
-      ok: true,
-      score: surepassResult.cibilScore,
-      report_number: surepassResult.reportNumber,
-      report_date: surepassResult.reportDate,
-      report_time: surepassResult.reportTime,
-      raw: surepassResult.providerRaw,
-    });
+    const out = await commitCibilFromPrecheckSession(
+      req,
+      payment,
+      { razorpay_payment_id },
+      session
+    );
+
+    return res.json(out);
   } catch (err) {
     const ax = err && err.isAxiosError ? err : null;
     const status = ax?.response?.status || 500;

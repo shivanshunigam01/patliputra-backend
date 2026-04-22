@@ -321,20 +321,39 @@ async function commitCibilFromPrecheckSession(
     rawResponse: session.providerRaw || {},
   });
 
+  let experianLink = session.experianPdfLink;
+  if (!experianLink) {
+    const pdfRes = await fetchExperianPdfLinkFromSurepass({
+      name: session.name,
+      mobileStr: session.mobile,
+      panStr: session.pan,
+      consent: "Y",
+    });
+    if (pdfRes.ok) {
+      experianLink = pdfRes.link;
+      await CibilPrecheckSession.updateOne(
+        { _id: session._id },
+        { $set: { experianPdfLink: experianLink } }
+      );
+    } else {
+      console.error("commit: Experian PDF link failed", pdfRes.error, pdfRes.status);
+    }
+  }
+
   let creditReportUrl = null;
-  if (session.experianPdfLink) {
-    const storedPath = await downloadExperianPdfToLocalDisk(session.experianPdfLink);
+  if (experianLink) {
+    const storedPath = await downloadExperianPdfToLocalDisk(experianLink);
     if (storedPath) {
       await updateLatestCibilPdfFields(session.mobile, session.pan, {
-        experian_pdf_link: session.experianPdfLink,
+        experian_pdf_link: experianLink,
         cibil_pdf_report_url: storedPath,
       });
       creditReportUrl = publicFileAbsoluteUrl(req, storedPath);
     } else {
       await updateLatestCibilPdfFields(session.mobile, session.pan, {
-        experian_pdf_link: session.experianPdfLink,
+        experian_pdf_link: experianLink,
       });
-      creditReportUrl = publicFileAbsoluteUrl(req, session.experianPdfLink);
+      creditReportUrl = publicFileAbsoluteUrl(req, experianLink);
     }
   }
 
@@ -407,30 +426,32 @@ router.post("/cibil-precheck", async (req, res) => {
         pan: panStr,
       });
     } catch (spErr) {
+      const pStatus =
+        spErr?.providerStatus ??
+        spErr?.response?.status ??
+        null;
+      console.error(
+        "cibil-precheck Surepass JSON:",
+        pStatus,
+        spErr?.message,
+        spErr?.response?.data || spErr?.providerData || ""
+      );
       return res.status(502).json({
         ok: false,
         cibil_status: "failed",
+        stage: "cibil_json",
+        provider_status: pStatus,
         error:
           spErr?.message ||
           "CIBIL provider could not verify these details. Check name, mobile, and PAN.",
       });
     }
 
-    const pdfRes = await fetchExperianPdfLinkFromSurepass({
-      name: name.trim(),
-      mobileStr,
-      panStr,
-      consent,
-    });
-
-    if (!pdfRes.ok) {
-      return res.status(502).json({
-        ok: false,
-        cibil_status: "pdf_failed",
-        error:
-          pdfRes.error || "CIBIL PDF could not be generated. Please try again.",
-      });
-    }
+    /*
+     * Do NOT call the Experian PDF API here. Surepass often rejects a second
+     * immediate call (same PAN) after the JSON report call → 502 in production.
+     * PDF link is obtained once after successful payment in commitCibilFromPrecheckSession.
+     */
 
     const precheckId = crypto.randomBytes(24).toString("hex");
     const expiresAt = new Date(Date.now() + PRECHECK_TTL_MS);
@@ -445,7 +466,7 @@ router.post("/cibil-precheck", async (req, res) => {
       reportDate: surepassResult.reportDate,
       reportTime: surepassResult.reportTime,
       providerRaw: surepassResult.providerRaw,
-      experianPdfLink: pdfRes.link,
+      experianPdfLink: null,
       status: "ready",
       expiresAt,
     });
@@ -457,8 +478,10 @@ router.post("/cibil-precheck", async (req, res) => {
       message: "Details verified. Proceed to payment to view your score and report.",
     });
   } catch (err) {
-    console.error("cibil-precheck error:", err?.message);
-    return res.status(500).json({ ok: false, error: "Pre-check failed" });
+    console.error("cibil-precheck error:", err?.message, err);
+    return res
+      .status(500)
+      .json({ ok: false, error: err?.message || "Pre-check failed" });
   }
 });
 

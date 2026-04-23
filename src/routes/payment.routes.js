@@ -64,6 +64,11 @@ const SUREPASS_BASE_URL = (
 ).trim();
 const SUREPASS_TOKEN = (process.env.SUREPASS_TOKEN || "").trim();
 
+const CIBIL_CHECK_AMOUNT_INR = Math.round(
+  Number(process.env.CIBIL_CHECK_AMOUNT_INR || 79)
+);
+const CIBIL_CHECK_AMOUNT_PAISE = CIBIL_CHECK_AMOUNT_INR * 100;
+
 if (!/^https?:\/\//i.test(SUREPASS_BASE_URL)) {
   console.error(
     `Misconfigured SUREPASS_BASE_URL: "${SUREPASS_BASE_URL}" (must start with http/https)`
@@ -597,7 +602,7 @@ router.post("/cibil-precheck", async (req, res) => {
 });
 
 /* =========================
-   Step 1: Create Razorpay order (₹99)
+   Step 1: Create Razorpay order (CIBIL_CHECK_AMOUNT_INR)
 ========================= */
 router.post("/razorpay/order", async (req, res) => {
   try {
@@ -629,7 +634,7 @@ router.post("/razorpay/order", async (req, res) => {
     const razor = getRazorpayInstance();
 
     const order = await razor.orders.create({
-      amount: 1 * 100,
+      amount: CIBIL_CHECK_AMOUNT_PAISE,
       currency: "INR",
       receipt: `cibil_${Date.now()}`,
     });
@@ -839,7 +844,7 @@ router.post(
         {
           $set: {
             purpose: "cibil_check",
-            amount: 99,
+            amount: CIBIL_CHECK_AMOUNT_INR,
             currency: "INR",
             razorpay_order_id,
             razorpay_payment_id,

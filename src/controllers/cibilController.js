@@ -21,7 +21,7 @@ export const createCibilPaymentOrder = asyncHandler(async (req, res) => {
   const { error, value } = createOrderSchema.validate(req.body, { abortEarly: false, stripUnknown: true });
   if (error) throw error;
 
-  const amount = Math.round(Number(process.env.CIBIL_CHECK_AMOUNT_INR || 1) * 100); // paise
+  const amount = Math.round(Number(process.env.CIBIL_CHECK_AMOUNT_INR || 79) * 100); // paise
   const rzp = getRazorpayClient();
 
   const order = await rzp.orders.create({
@@ -195,3 +195,4 @@ export const cibilAnalytics = asyncHandler(async (_req, res) => {
   const total = await CibilCheck.countDocuments();
   return ok(res, { total_cibil_checks: total });
 });
+

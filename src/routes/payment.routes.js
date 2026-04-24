@@ -75,9 +75,9 @@ const SUREPASS_BASE_URL = (
 const SUREPASS_TOKEN = (process.env.SUREPASS_TOKEN || "").trim();
 
 function getAmountsForReportKind(reportKind) {
-  const experianInr = Math.round(Number(process.env.CIBIL_CHECK_AMOUNT_INR || 1));
+  const experianInr = Math.round(Number(process.env.CIBIL_CHECK_AMOUNT_INR || 79));
   const cibilCreditInr = Math.round(
-    Number(process.env.CIBIL_CREDIT_REPORT_AMOUNT_INR || 1)
+    Number(process.env.CIBIL_CREDIT_REPORT_AMOUNT_INR || 125)
   );
   const inr = reportKind === "cibil_credit_report" ? cibilCreditInr : experianInr;
   return { inr, paise: inr * 100 };

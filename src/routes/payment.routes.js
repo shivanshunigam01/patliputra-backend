@@ -399,19 +399,20 @@ async function fetchCibilCreditReportPdfFromSurepass({
     };
   }
 
-  const d = spRes.data?.data ?? spRes.data;
-  const link =
-    d?.credit_report_link || d?.report_url || spRes.data?.credit_report_link;
-
-  if (!link) {
-    return { ok: false, status: 502, error: "No PDF link in CIBIL credit report response" };
-  }
   if (spRes.data && spRes.data.success === false) {
     return {
       ok: false,
       status: 502,
       error: spRes.data?.message || "CIBIL PDF API returned success: false",
     };
+  }
+
+  const d = spRes.data?.data ?? spRes.data;
+  const link =
+    d?.credit_report_link || d?.report_url || spRes.data?.credit_report_link;
+
+  if (!link) {
+    return { ok: false, status: 502, error: "No PDF link in CIBIL credit report response" };
   }
   return { ok: true, link, data: spRes.data };
 }
@@ -423,6 +424,20 @@ function normalizeReportKind(body) {
   if (k === "cibil_credit_report" || k === "cibil_report" || k === "cibil")
     return "cibil_credit_report";
   return "experian";
+}
+
+/**
+ * CIBIL bureau product vs Experian: any trusted source that says
+ * cibil_credit_report wins (session, payment metadata, or form).
+ */
+function resolveProductReportKind({ fromSession, fromPaymentMetadata, fromClient } = {}) {
+  const candidates = [fromSession, fromPaymentMetadata, fromClient].filter(
+    (x) => x != null && String(x).trim() !== ""
+  );
+  if (!candidates.length) return "experian";
+  const kindsNorm = candidates.map((c) => normalizeReportKind({ report_kind: c }));
+  if (kindsNorm.includes("cibil_credit_report")) return "cibil_credit_report";
+  return normalizeReportKind({ report_kind: candidates[0] });
 }
 
 function normalizeGenderInput(g) {
@@ -530,6 +545,7 @@ async function upsertPaymentOrder(
   precheckId = null,
   meta = {}
 ) {
+  const reportKind = meta.reportKind || "experian";
   const setOnInsert = {
     purpose: "cibil_check",
     amount: order.amount / 100,
@@ -537,15 +553,16 @@ async function upsertPaymentOrder(
     razorpay_order_id: order.id,
     status: "created",
   };
+  const update = { $setOnInsert: setOnInsert };
   if (precheckId) {
-    setOnInsert.metadata = {
-      precheck_id: precheckId,
-      cibil_report_kind: meta.reportKind || "experian",
+    update.$set = {
+      "metadata.precheck_id": precheckId,
+      "metadata.cibil_report_kind": reportKind,
     };
   }
   await Payment.findOneAndUpdate(
     { razorpay_order_id: order.id },
-    { $setOnInsert: setOnInsert },
+    update,
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
 }
@@ -557,10 +574,28 @@ async function upsertPaymentOrder(
 async function commitCibilFromPrecheckSession(
   req,
   paymentDoc,
-  { razorpay_payment_id, aadhaar_number, aadhaar_document_url },
+  {
+    razorpay_payment_id,
+    aadhaar_number,
+    aadhaar_document_url,
+    client_report_kind: clientReportKind,
+  },
   session
 ) {
-  const reportKind = session.reportKind || "experian";
+  let leanSession = null;
+  try {
+    if (session?._id) {
+      leanSession = await CibilPrecheckSession.findById(session._id).lean();
+    }
+  } catch (e) {
+    console.warn("commit: precheck session reload failed", e?.message);
+  }
+  const s0 = leanSession || (typeof session?.toObject === "function" ? session.toObject() : session);
+  const reportKind = resolveProductReportKind({
+    fromSession: s0?.reportKind,
+    fromPaymentMetadata: paymentDoc?.metadata?.cibil_report_kind,
+    fromClient: clientReportKind,
+  });
   const isCibilCredit = reportKind === "cibil_credit_report";
 
   const baseRaw =
@@ -574,32 +609,35 @@ async function commitCibilFromPrecheckSession(
   let reportNumber = session.reportNumber;
   let reportDate = session.reportDate;
   let reportTime = session.reportTime;
-  let providerPdfLink = session.experianPdfLink;
+  let providerPdfLink = isCibilCredit ? null : session.experianPdfLink;
 
   if (isCibilCredit) {
-    if (!providerPdfLink) {
-      const pdfRes = await fetchCibilCreditReportPdfFromSurepass({
-        name: session.name,
-        mobileStr: session.mobile,
-        panStr: session.pan,
-        gender: session.gender || "male",
-        consent: "Y",
-      });
-      if (pdfRes.ok) {
-        providerPdfLink = pdfRes.link;
-        const block = pdfRes.data?.data || pdfRes.data;
-        const scoreFromPdf = toNumberOrNull(
-          block?.credit_score ?? block?.cibil_score ?? block?.score
-        );
-        if (scoreFromPdf != null) finalScore = scoreFromPdf;
-        mergedRaw = { ...mergedRaw, cibil_credit_report_pdf: block || pdfRes.data };
-        await CibilPrecheckSession.updateOne(
-          { _id: session._id },
-          { $set: { experianPdfLink: providerPdfLink } }
-        );
-      } else {
-        console.error("commit: CIBIL credit PDF failed", pdfRes.error, pdfRes.status);
-      }
+    console.log("commit: CIBIL bureau fetch-report-pdf (credit-report-cibil)");
+    const pdfRes = await fetchCibilCreditReportPdfFromSurepass({
+      name: session.name,
+      mobileStr: session.mobile,
+      panStr: session.pan,
+      gender: session.gender || "male",
+      consent: "Y",
+    });
+    if (pdfRes.ok) {
+      providerPdfLink = pdfRes.link;
+      const block = pdfRes.data?.data || pdfRes.data;
+      const scoreFromPdf = toNumberOrNull(
+        block?.credit_score ?? block?.cibil_score ?? block?.score
+      );
+      if (scoreFromPdf != null) finalScore = scoreFromPdf;
+      mergedRaw = { ...mergedRaw, cibil_credit_report_pdf: block || pdfRes.data };
+      await CibilPrecheckSession.updateOne(
+        { _id: session._id },
+        { $set: { experianPdfLink: providerPdfLink } }
+      );
+    } else {
+      console.error(
+        "commit: CIBIL credit PDF failed",
+        pdfRes.error,
+        pdfRes.status
+      );
     }
   } else if (!providerPdfLink) {
     const pdfRes = await fetchExperianPdfLinkFromSurepass({
@@ -935,7 +973,12 @@ router.post(
         pan,
         aadhaar,
         aadhaar_number: aadhaarNumberField,
+        report_kind: reportKindBody,
+        reportKind: reportKindAlt,
       } = req.body;
+      const clientReportKind = String(
+        reportKindBody || reportKindAlt || ""
+      ).trim();
 
       if (req.file) uploadedPath = req.file.path;
 
@@ -1078,9 +1121,12 @@ router.post(
           .join("uploads", "cibil-aadhaar", path.basename(req.file.path))
           .replace(/\\/g, "/");
 
-      const paidInr = getAmountsForReportKind(
-        session.reportKind || "experian"
-      ).inr;
+      const productKind = resolveProductReportKind({
+        fromSession: session.reportKind,
+        fromPaymentMetadata: payment.metadata?.cibil_report_kind,
+        fromClient: clientReportKind,
+      });
+      const paidInr = getAmountsForReportKind(productKind).inr;
 
       await Payment.updateOne(
         { _id: payment._id },
@@ -1092,7 +1138,7 @@ router.post(
             razorpay_order_id,
             razorpay_payment_id,
             razorpay_signature,
-            "metadata.cibil_report_kind": session.reportKind || "experian",
+            "metadata.cibil_report_kind": productKind,
           },
         }
       );
@@ -1104,6 +1150,7 @@ router.post(
           razorpay_payment_id,
           aadhaar_number: aadhaar12,
           aadhaar_document_url: aadhaarDocRel,
+          client_report_kind: clientReportKind,
         },
         session
       );

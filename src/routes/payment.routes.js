@@ -58,6 +58,23 @@ function normalizeAadhaar12(value) {
   return d.length === 12 ? d : null;
 }
 
+/** Relative `/uploads/...` path for CibilCheck.aadhaar_document_url (admin panel). */
+function normalizeAadhaarDocPathForDb(input) {
+  if (input == null) return null;
+  const s = String(input).trim();
+  if (!s) return null;
+  if (s.startsWith("/uploads/")) return s;
+  if (/^https?:\/\//i.test(s)) {
+    try {
+      const p = new URL(s).pathname;
+      return p.startsWith("/uploads/") ? p : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 router.get("/ping", (req, res) => {
   res.json({ ok: true, msg: "payment route alive" });
 });
@@ -107,6 +124,13 @@ const leadIntakeHandler = async (req, res) => {
       ? "/" + path.join("uploads", "cibil-aadhaar", path.basename(panDoc.path)).replace(/\\/g, "/")
       : null;
 
+    if (!aadhaarDocUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "Aadhaar document file is required (PDF, PNG, or JPG).",
+      });
+    }
+
     const lead = await Lead.create({
       lead_number: createLeadNumber(),
       source: "Website",
@@ -129,6 +153,9 @@ const leadIntakeHandler = async (req, res) => {
       success: true,
       id: lead._id,
       lead_number: lead.lead_number,
+      /** Relative path for DB + /experian-pdf (same as CibilCheck.aadhaar_document_url). */
+      aadhaar_document_path: aadhaarDocUrl,
+      pan_document_path: panDocUrl,
       aadhaar_document_url: aadhaarDocUrl ? publicFileAbsoluteUrl(req, aadhaarDocUrl) : null,
       pan_document_url: panDocUrl ? publicFileAbsoluteUrl(req, panDocUrl) : null,
     });
@@ -239,23 +266,25 @@ router.post("/verify-payment", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid Razorpay signature." });
     }
 
-    const payment = await Payment.findOneAndUpdate(
-      { razorpay_order_id },
-      {
-        $set: {
-          status: "paid",
-          razorpay_payment_id,
-          razorpay_signature,
-          customer_name: String(req.body?.name || "").trim(),
-          mobile: String(req.body?.mobile || "").replace(/\D/g, "").slice(-10),
-          "metadata.pan": String(req.body?.pan || "").toUpperCase().trim(),
-          "metadata.aadhaar": String(req.body?.aadhaar || "")
-            .replace(/\D/g, "")
-            .slice(0, 12),
-        },
-      },
-      { new: true }
-    );
+    const docPathMeta = normalizeAadhaarDocPathForDb(req.body?.aadhaar_document_url);
+    const $setVerify = {
+      status: "paid",
+      razorpay_payment_id,
+      razorpay_signature,
+      customer_name: String(req.body?.name || "").trim(),
+      mobile: String(req.body?.mobile || "").replace(/\D/g, "").slice(-10),
+      "metadata.pan": String(req.body?.pan || "").toUpperCase().trim(),
+      "metadata.aadhaar": String(req.body?.aadhaar || "")
+        .replace(/\D/g, "")
+        .slice(0, 12),
+    };
+    if (docPathMeta) {
+      $setVerify["metadata.aadhaar_document_path"] = docPathMeta;
+    }
+
+    const payment = await Payment.findOneAndUpdate({ razorpay_order_id }, { $set: $setVerify }, {
+      new: true,
+    });
 
     if (!payment) {
       return res.status(404).json({
@@ -470,8 +499,12 @@ async function saveCibilResult({
     raw_response: rawSafe,
     payment_id: paymentId,
   };
-  if (aadhaarNumber) payload.aadhaar_number = aadhaarNumber;
-  if (aadhaarDocumentUrl) payload.aadhaar_document_url = aadhaarDocumentUrl;
+  const a12 =
+    aadhaarNumber != null && String(aadhaarNumber).replace(/\D/g, "").length === 12
+      ? String(aadhaarNumber).replace(/\D/g, "").slice(0, 12)
+      : null;
+  if (a12) payload.aadhaar_number = a12;
+  if (aadhaarDocumentUrl) payload.aadhaar_document_url = String(aadhaarDocumentUrl).trim();
 
   await CibilCheck.findOneAndUpdate({ payment_id: paymentId }, payload, {
     upsert: true,
@@ -1499,7 +1532,17 @@ router.post("/razorpay/retry-cibil", async (req, res) => {
 ========================= */
 router.post("/experian-pdf", async (req, res) => {
   try {
-    const { name, mobile, pan, consent = "Y" } = req.body;
+    const {
+      name,
+      mobile,
+      pan,
+      consent = "Y",
+      aadhaar,
+      aadhaar_number,
+      aadhaar_document_url,
+      razorpay_payment_id,
+      razorpay_order_id,
+    } = req.body;
 
     if (!name || !mobile || !pan) {
       return res
@@ -1530,6 +1573,14 @@ router.post("/experian-pdf", async (req, res) => {
         .json({ ok: false, error: "PAN format invalid (ABCDE1234F)" });
     }
 
+    const aadhaar12 = normalizeAadhaar12(aadhaar ?? aadhaar_number);
+    let docRel = normalizeAadhaarDocPathForDb(aadhaar_document_url);
+    const rzpOrder = String(razorpay_order_id || "").trim();
+    if (!docRel && rzpOrder) {
+      const pay = await Payment.findOne({ razorpay_order_id: rzpOrder }).lean();
+      docRel = normalizeAadhaarDocPathForDb(pay?.metadata?.aadhaar_document_path);
+    }
+
     const pdfRes = await fetchExperianPdfLinkFromSurepass({
       name: String(name).trim(),
       mobileStr,
@@ -1558,9 +1609,10 @@ router.post("/experian-pdf", async (req, res) => {
         : toNumberOrNull(
             block?.credit_score ?? block?.cibil_score ?? block?.score
           );
-    const paymentId = `direct_experian_${Date.now()}_${crypto
-      .randomBytes(4)
-      .toString("hex")}`;
+    const rzpPay = String(razorpay_payment_id || "").trim();
+    const paymentId =
+      rzpPay ||
+      `direct_experian_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
 
     await saveCibilResult({
       paymentId,
@@ -1569,6 +1621,8 @@ router.post("/experian-pdf", async (req, res) => {
       pan: panStr,
       cibilScore: score,
       rawResponse: { experian_credit_report_pdf: block || pdfRes.data },
+      aadhaarNumber: aadhaar12,
+      aadhaarDocumentUrl: docRel,
     });
 
     const storedPath = await downloadExperianPdfToLocalDisk(providerLink);

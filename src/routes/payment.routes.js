@@ -7,6 +7,7 @@ import axios from "axios";
 import { Payment } from "../models/Payment.js";
 import { CibilCheck } from "../models/CibilCheck.js";
 import { CibilPrecheckSession } from "../models/CibilPrecheckSession.js";
+import { Lead } from "../models/Lead.js";
 import multer from "multer";
 
 import dotenv from "dotenv";
@@ -47,6 +48,11 @@ const aadhaarUploadMiddleware = multer({
   },
 });
 
+const cibilLeadUploadMiddleware = multer({
+  storage: aadhaarStorage,
+  limits: { fileSize: 5 * 1024 * 1024, files: 4 },
+});
+
 function normalizeAadhaar12(value) {
   const d = String(value || "").replace(/\D/g, "");
   return d.length === 12 ? d : null;
@@ -54,6 +60,220 @@ function normalizeAadhaar12(value) {
 
 router.get("/ping", (req, res) => {
   res.json({ ok: true, msg: "payment route alive" });
+});
+
+function createLeadNumber() {
+  return `LD-${Date.now()}`;
+}
+
+/**
+ * Flow 1: intake endpoint for frontend before Razorpay checkout.
+ * Accepts multipart/form-data and stores uploaded doc links in lead notes.
+ */
+const leadIntakeHandler = async (req, res) => {
+  try {
+    const name = String(req.body?.name || req.body?.customer_name || "").trim();
+    const mobile = String(req.body?.mobile || req.body?.customer_mobile || "")
+      .replace(/\D/g, "")
+      .slice(-10);
+    const pan = String(req.body?.pan || req.body?.customer_pan || "")
+      .toUpperCase()
+      .trim();
+    const aadhaar = normalizeAadhaar12(
+      req.body?.aadhaar || req.body?.customer_aadhaar || req.body?.aadhaar_number
+    );
+
+    if (!name || !/^\d{10}$/.test(mobile) || !/^[A-Z]{5}\d{4}[A-Z]$/.test(pan) || !aadhaar) {
+      return res.status(400).json({
+        ok: false,
+        error: "Valid name, mobile, PAN, and 12-digit Aadhaar are required.",
+      });
+    }
+
+    const files = Array.isArray(req.files) ? req.files : [];
+    const aadhaarDoc = files.find((f) =>
+      ["aadhaar_document", "aadhaar_file", "document_aadhaar", "aadhaar_card"].includes(
+        f.fieldname
+      )
+    );
+    const panDoc = files.find((f) =>
+      ["pan_file", "document_pan", "pan_card"].includes(f.fieldname)
+    );
+
+    const aadhaarDocUrl = aadhaarDoc
+      ? "/" + path.join("uploads", "cibil-aadhaar", path.basename(aadhaarDoc.path)).replace(/\\/g, "/")
+      : null;
+    const panDocUrl = panDoc
+      ? "/" + path.join("uploads", "cibil-aadhaar", path.basename(panDoc.path)).replace(/\\/g, "/")
+      : null;
+
+    const lead = await Lead.create({
+      lead_number: createLeadNumber(),
+      source: "Website",
+      source_page: "CIBIL Score",
+      customer_name: name,
+      customer_mobile: mobile,
+      customer_district: String(req.body?.customer_district || "Patna"),
+      notes: [
+        {
+          note: `CIBIL KYC intake | PAN: ${pan} | Aadhaar: ${aadhaar} | Aadhaar file: ${
+            aadhaarDocUrl || "not_uploaded"
+          } | PAN file: ${panDocUrl || "not_uploaded"}`,
+          created_by: null,
+        },
+      ],
+    });
+
+    return res.json({
+      ok: true,
+      success: true,
+      id: lead._id,
+      lead_number: lead.lead_number,
+      aadhaar_document_url: aadhaarDocUrl ? publicFileAbsoluteUrl(req, aadhaarDocUrl) : null,
+      pan_document_url: panDocUrl ? publicFileAbsoluteUrl(req, panDocUrl) : null,
+    });
+  } catch (err) {
+    console.error("lead-intake error:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Failed to save lead intake" });
+  }
+};
+
+router.post("/lead-intake", cibilLeadUploadMiddleware.any(), leadIntakeHandler);
+router.post("/cibil-intake", cibilLeadUploadMiddleware.any(), leadIntakeHandler);
+router.post("/precheck", cibilLeadUploadMiddleware.any(), leadIntakeHandler);
+
+/**
+ * Flow 1: create Razorpay order for the CIBIL report.
+ */
+router.post("/create-order", async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const mobile = String(req.body?.mobile || "").replace(/\D/g, "").slice(-10);
+    const pan = String(req.body?.pan || "").toUpperCase().trim();
+    const reportKind = normalizeReportKind(req.body);
+    const { paise, inr } = getAmountsForReportKind(reportKind);
+
+    if (!name || !/^\d{10}$/.test(mobile) || !/^[A-Z]{5}\d{4}[A-Z]$/.test(pan)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Valid name, mobile, and PAN are required.",
+      });
+    }
+
+    const razor = getRazorpayInstance();
+    const order = await razor.orders.create({
+      amount: paise,
+      currency: "INR",
+      receipt: `cibil_${Date.now()}`,
+      notes: {
+        purpose: "experian_cibil_report",
+        mobile,
+        pan,
+        report_kind: reportKind,
+      },
+    });
+
+    await Payment.findOneAndUpdate(
+      { razorpay_order_id: order.id },
+      {
+        $setOnInsert: {
+          purpose: "cibil_check",
+          amount: inr,
+          currency: order.currency,
+          razorpay_order_id: order.id,
+          status: "created",
+        },
+        $set: {
+          customer_name: name,
+          mobile,
+          metadata: {
+            pan,
+            aadhaar: String(req.body?.aadhaar || "").replace(/\D/g, "").slice(0, 12),
+            cibil_report_kind: reportKind,
+          },
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return res.json({
+      ok: true,
+      id: order.id,
+      order_id: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      key: process.env.RAZORPAY_KEY_ID,
+      key_id: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (err) {
+    console.error("create-order error:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: "Unable to create payment order.",
+    });
+  }
+});
+
+/**
+ * Flow 1: verify Razorpay payment only. PDF generation happens via /experian-pdf.
+ */
+router.post("/verify-payment", async (req, res) => {
+  try {
+    const razorpay_order_id = String(req.body?.razorpay_order_id || "").trim();
+    const razorpay_payment_id = String(req.body?.razorpay_payment_id || "").trim();
+    const razorpay_signature = String(req.body?.razorpay_signature || "").trim();
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing Razorpay verification fields.",
+      });
+    }
+
+    const signBody = `${razorpay_order_id}|${razorpay_payment_id}`;
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(signBody)
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ ok: false, error: "Invalid Razorpay signature." });
+    }
+
+    const payment = await Payment.findOneAndUpdate(
+      { razorpay_order_id },
+      {
+        $set: {
+          status: "paid",
+          razorpay_payment_id,
+          razorpay_signature,
+          customer_name: String(req.body?.name || "").trim(),
+          mobile: String(req.body?.mobile || "").replace(/\D/g, "").slice(-10),
+          "metadata.pan": String(req.body?.pan || "").toUpperCase().trim(),
+          "metadata.aadhaar": String(req.body?.aadhaar || "")
+            .replace(/\D/g, "")
+            .slice(0, 12),
+        },
+      },
+      { new: true }
+    );
+
+    if (!payment) {
+      return res.status(404).json({
+        ok: false,
+        error: "Payment order not found.",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      verified: true,
+      razorpay_order_id,
+      razorpay_payment_id,
+    });
+  } catch (err) {
+    console.error("verify-payment error:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "Payment verification failed." });
+  }
 });
 
 /** Public fee hints for CIBIL UI (INR) */

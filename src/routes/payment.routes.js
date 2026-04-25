@@ -70,7 +70,7 @@ router.get("/cibil-pricing", (req, res) => {
    Env for Surepass
 ========================= */
 const SUREPASS_BASE_URL = (
-  process.env.SUREPASS_BASE_URL || "https://kyc-api.surepass.io"
+  process.env.SUREPASS_BASE_URL || "https://kyc-api.surepass.app"
 ).trim();
 const SUREPASS_TOKEN = (process.env.SUREPASS_TOKEN || "").trim();
 
@@ -92,12 +92,7 @@ if (!SUREPASS_TOKEN) {
   console.error("❌ Missing SUREPASS_TOKEN (JWT) in environment");
 }
 
-// Build endpoints robustly
-const SUREPASS_JSON_ENDPOINT = new URL(
-  "/api/v1/credit-report-experian/fetch-report",
-  SUREPASS_BASE_URL
-).toString();
-
+// Only these two Surepass APIs are used (no separate JSON / fetch-report call).
 const SUREPASS_PDF_ENDPOINT = new URL(
   "/api/v1/credit-report-experian/fetch-report-pdf",
   SUREPASS_BASE_URL
@@ -275,9 +270,52 @@ function normalizePersonName(n) {
 }
 
 /**
- * Fetches Experian credit report PDF from Surepass (same product as precheck JSON, PDF step after payment).
- * Response shape: data.credit_score (string or number), data.credit_report_link, etc.
- * @returns {{ ok: true, link: string, data: object } | { ok: false, status: number, error: string }}
+ * fetch-report-pdf may return HTTP 422, success: false, but still include credit_report_link
+ * and credit_score — we treat a valid PDF URL as success.
+ */
+function parseSurepassFetchReportPdfResponse(spRes) {
+  if (!spRes) {
+    return { ok: false, status: 503, error: "No response from Surepass" };
+  }
+  const httpStatus = spRes.status;
+  const body = spRes.data || {};
+  const d =
+    body.data != null && typeof body.data === "object" && !Array.isArray(body.data)
+      ? body.data
+      : {};
+  const link = d.credit_report_link || d.report_url || body.credit_report_link;
+  const scoreRaw = d.credit_score;
+  const creditScore = toNumberOrNull(
+    scoreRaw === "" || scoreRaw === undefined || scoreRaw === null
+      ? null
+      : scoreRaw
+  );
+
+  if (link && String(link).trim().match(/^https?:\/\//i)) {
+    return {
+      ok: true,
+      link: String(link).trim(),
+      data: body,
+      creditScore,
+      httpStatus,
+    };
+  }
+
+  const errMsg =
+    body.message ||
+    String(body.message_code || "") ||
+    "No PDF link in provider response";
+  return {
+    ok: false,
+    status: httpStatus >= 400 && httpStatus < 600 ? httpStatus : 502,
+    error: errMsg,
+    data: body,
+    httpStatus,
+  };
+}
+
+/**
+ * Experian: …/api/v1/credit-report-experian/fetch-report-pdf
  */
 async function fetchExperianPdfLinkFromSurepass({
   name,
@@ -311,36 +349,11 @@ async function fetchExperianPdfLinkFromSurepass({
       };
     }
   }
-
-  if (!spRes || spRes.status < 200 || spRes.status >= 300) {
-    return {
-      ok: false,
-      status: spRes?.status || 502,
-      error: spRes?.data?.message || spRes?.data?.error || "Surepass PDF API failed",
-    };
-  }
-
-  const link =
-    spRes.data?.data?.credit_report_link ||
-    spRes.data?.data?.report_url ||
-    spRes.data?.credit_report_link;
-
-  if (!link) {
-    return { ok: false, status: 502, error: "No PDF link in provider response" };
-  }
-  if (spRes.data && spRes.data.success === false) {
-    return {
-      ok: false,
-      status: 502,
-      error: spRes.data?.message || "Experian PDF API returned success: false",
-    };
-  }
-  return { ok: true, link, data: spRes.data };
+  return parseSurepassFetchReportPdfResponse(spRes);
 }
 
 /**
- * CIBIL Credit Report (bureau) PDF – Surepass
- * @returns {{ ok: true, link: string, data: object } | { ok: false, status: number, error: string }}
+ * TransUnion CIBIL: …/api/v1/credit-report-cibil/fetch-report-pdf
  */
 async function fetchCibilCreditReportPdfFromSurepass({
   name,
@@ -349,7 +362,7 @@ async function fetchCibilCreditReportPdfFromSurepass({
   gender = "male",
   consent = "Y",
 }) {
-  const body = {
+  const requestBody = {
     name: String(name || "").trim(),
     mobile: mobileStr,
     pan: String(panStr).toUpperCase(),
@@ -369,14 +382,14 @@ async function fetchCibilCreditReportPdfFromSurepass({
   try {
     spRes = await axios.post(
       SUREPASS_CIBIL_CREDIT_PDF_ENDPOINT,
-      body,
+      requestBody,
       cibilPostOpts
     );
   } catch (e1) {
     try {
       spRes = await axios.post(
         SUREPASS_CIBIL_CREDIT_PDF_ENDPOINT,
-        body,
+        requestBody,
         cibilPostOpts
       );
     } catch (e2) {
@@ -390,31 +403,7 @@ async function fetchCibilCreditReportPdfFromSurepass({
       };
     }
   }
-
-  if (!spRes || spRes.status < 200 || spRes.status >= 300) {
-    return {
-      ok: false,
-      status: spRes?.status || 502,
-      error: spRes?.data?.message || spRes?.data?.error || "CIBIL Credit Report PDF API failed",
-    };
-  }
-
-  if (spRes.data && spRes.data.success === false) {
-    return {
-      ok: false,
-      status: 502,
-      error: spRes.data?.message || "CIBIL PDF API returned success: false",
-    };
-  }
-
-  const d = spRes.data?.data ?? spRes.data;
-  const link =
-    d?.credit_report_link || d?.report_url || spRes.data?.credit_report_link;
-
-  if (!link) {
-    return { ok: false, status: 502, error: "No PDF link in CIBIL credit report response" };
-  }
-  return { ok: true, link, data: spRes.data };
+  return parseSurepassFetchReportPdfResponse(spRes);
 }
 
 function normalizeReportKind(body) {
@@ -448,96 +437,6 @@ function normalizeGenderInput(g) {
   if (["female", "f"].includes(s)) return "female";
   if (["other", "o", "transgender", "trans"].includes(s)) return "other";
   return null;
-}
-
-async function callSurepassCibil({ name, mobile, pan }) {
-  const spRes = await axios.post(
-    SUREPASS_JSON_ENDPOINT,
-    {
-      name,
-      consent: "Y",
-      mobile: String(mobile),
-      pan: String(pan).toUpperCase(),
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${SUREPASS_TOKEN}`,
-      },
-      timeout: 60000,
-      validateStatus: () => true,
-    }
-  );
-
-  if (spRes.status < 200 || spRes.status >= 300) {
-    const providerMessage = spRes.data?.message || "Surepass error";
-    const err = new Error(providerMessage);
-    err.providerStatus = spRes.status;
-    err.providerData = spRes.data;
-    throw err;
-  }
-
-  const data = spRes.data?.data || {};
-  const scoreRaw =
-    data?.credit_score ??
-    data?.score ??
-    data?.cibil_score ??
-    data?.credit_report?.Score;
-
-  return {
-    providerRaw: data,
-    cibilScore: toNumberOrNull(scoreRaw),
-    reportNumber: data?.credit_report?.CreditProfileHeader?.ReportNumber ?? null,
-    reportDate: data?.credit_report?.CreditProfileHeader?.ReportDate ?? null,
-    reportTime: data?.credit_report?.CreditProfileHeader?.ReportTime ?? null,
-  };
-}
-
-function isRetryableNetworkError(err) {
-  if (!err) return false;
-  const code = err.code || err.cause?.code;
-  if (
-    ["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "EPIPE", "EAI_AGAIN", "ENOTFOUND"].includes(
-      String(code)
-    )
-  ) {
-    return true;
-  }
-  const msg = String(err.message || err.toString() || "");
-  if (/ECONNRESET|ETIMEDOUT|socket hang up|network|aborted|ECONN/i.test(msg)) {
-    return true;
-  }
-  return false;
-}
-
-/** Surepass is occasionally flaky; retry transient network + 502/503/504 from provider. */
-async function callSurepassCibilWithRetry(
-  { name, mobile, pan },
-  { maxAttempts = 3, delayMs = 700 } = {}
-) {
-  let lastErr;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await callSurepassCibil({ name, mobile, pan });
-    } catch (err) {
-      lastErr = err;
-      const st = err?.providerStatus;
-      const shouldRetryStatus =
-        st === 502 || st === 503 || st === 504 || st === 429;
-      const shouldRetry = shouldRetryStatus || (isRetryableNetworkError(err) && !st);
-
-      if (shouldRetry && attempt < maxAttempts) {
-        console.warn(
-          `callSurepassCibil retry ${attempt + 1}/${maxAttempts}:`,
-          st || err?.code || err?.message
-        );
-        await new Promise((r) => setTimeout(r, delayMs * attempt));
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw lastErr;
 }
 
 async function upsertPaymentOrder(
@@ -605,11 +504,12 @@ async function commitCibilFromPrecheckSession(
       ? { ...session.providerRaw }
       : {};
   let mergedRaw = baseRaw;
-  let finalScore = session.cibilScore;
+  let finalScore = null;
   let reportNumber = session.reportNumber;
   let reportDate = session.reportDate;
   let reportTime = session.reportTime;
   let providerPdfLink = isCibilCredit ? null : session.experianPdfLink;
+  let lastPdfError = null;
 
   if (isCibilCredit) {
     console.log("commit: CIBIL bureau fetch-report-pdf (credit-report-cibil)");
@@ -623,16 +523,21 @@ async function commitCibilFromPrecheckSession(
     if (pdfRes.ok) {
       providerPdfLink = pdfRes.link;
       const block = pdfRes.data?.data || pdfRes.data;
-      const scoreFromPdf = toNumberOrNull(
-        block?.credit_score ?? block?.cibil_score ?? block?.score
-      );
-      if (scoreFromPdf != null) finalScore = scoreFromPdf;
+      if (pdfRes.creditScore != null) {
+        finalScore = pdfRes.creditScore;
+      } else {
+        const scoreFromPdf = toNumberOrNull(
+          block?.credit_score ?? block?.cibil_score ?? block?.score
+        );
+        if (scoreFromPdf != null) finalScore = scoreFromPdf;
+      }
       mergedRaw = { ...mergedRaw, cibil_credit_report_pdf: block || pdfRes.data };
       await CibilPrecheckSession.updateOne(
         { _id: session._id },
         { $set: { experianPdfLink: providerPdfLink } }
       );
     } else {
+      lastPdfError = pdfRes.error;
       console.error(
         "commit: CIBIL credit PDF failed",
         pdfRes.error,
@@ -649,10 +554,14 @@ async function commitCibilFromPrecheckSession(
     if (pdfRes.ok) {
       providerPdfLink = pdfRes.link;
       const block = pdfRes.data?.data || pdfRes.data;
-      const scoreFromPdf = toNumberOrNull(
-        block?.credit_score ?? block?.cibil_score ?? block?.score
-      );
-      if (scoreFromPdf != null) finalScore = scoreFromPdf;
+      if (pdfRes.creditScore != null) {
+        finalScore = pdfRes.creditScore;
+      } else {
+        const scoreFromPdf = toNumberOrNull(
+          block?.credit_score ?? block?.cibil_score ?? block?.score
+        );
+        if (scoreFromPdf != null) finalScore = scoreFromPdf;
+      }
       mergedRaw = {
         ...mergedRaw,
         experian_credit_report_pdf: block || pdfRes.data,
@@ -662,8 +571,17 @@ async function commitCibilFromPrecheckSession(
         { $set: { experianPdfLink: providerPdfLink } }
       );
     } else {
+      lastPdfError = pdfRes.error;
       console.error("commit: Experian PDF link failed", pdfRes.error, pdfRes.status);
     }
+  }
+
+  if (!providerPdfLink) {
+    const err = new Error(
+      lastPdfError || "Credit report PDF could not be generated. No payment will be stored as complete until PDF is available."
+    );
+    err.cibilPdfFailed = true;
+    throw err;
   }
 
   await saveCibilResult({
@@ -728,7 +646,7 @@ async function commitCibilFromPrecheckSession(
 }
 
 /* =========================
-   Step 0: Pre-check (Surepass CIBIL + PDF) — must succeed before payment
+   Step 0: Pre-check (form validation only — no Surepass call until after payment)
 ========================= */
 router.post("/cibil-precheck", async (req, res) => {
   try {
@@ -786,50 +704,6 @@ router.post("/cibil-precheck", async (req, res) => {
       });
     }
 
-    let surepassResult;
-    try {
-      surepassResult = await callSurepassCibilWithRetry({
-        name: name.trim(),
-        mobile: mobileStr,
-        pan: panStr,
-      });
-    } catch (spErr) {
-      const pStatus =
-        spErr?.providerStatus ??
-        spErr?.response?.status ??
-        null;
-      const rawMsg = String(spErr?.message || "");
-      console.error(
-        "cibil-precheck Surepass JSON:",
-        pStatus,
-        rawMsg,
-        spErr?.response?.data || spErr?.providerData || ""
-      );
-
-      const transient =
-        isRetryableNetworkError(spErr) ||
-        /ECONNRESET|ETIMEDOUT|socket hang up/i.test(rawMsg);
-      const publicError = transient
-        ? "The CIBIL service connection dropped. Please try again in a few seconds."
-        : rawMsg ||
-          "CIBIL provider could not verify these details. Check name, mobile, and PAN.";
-
-      return res.status(502).json({
-        ok: false,
-        cibil_status: "failed",
-        stage: "cibil_json",
-        provider_status: pStatus,
-        error: publicError,
-        retry_suggested: transient,
-      });
-    }
-
-    /*
-     * Do NOT call the Experian PDF API here. Surepass often rejects a second
-     * immediate call (same PAN) after the JSON report call → 502 in production.
-     * PDF link is obtained once after successful payment in commitCibilFromPrecheckSession.
-     */
-
     const precheckId = crypto.randomBytes(24).toString("hex");
     const expiresAt = new Date(Date.now() + PRECHECK_TTL_MS);
 
@@ -843,11 +717,11 @@ router.post("/cibil-precheck", async (req, res) => {
       aadhaarNumber: aadhaar12,
       reportKind,
       gender: reportKind === "cibil_credit_report" ? gender : undefined,
-      cibilScore: surepassResult.cibilScore,
-      reportNumber: surepassResult.reportNumber,
-      reportDate: surepassResult.reportDate,
-      reportTime: surepassResult.reportTime,
-      providerRaw: surepassResult.providerRaw,
+      cibilScore: null,
+      reportNumber: null,
+      reportDate: null,
+      reportTime: null,
+      providerRaw: {},
       experianPdfLink: null,
       status: "ready",
       expiresAt,
@@ -1169,12 +1043,15 @@ router.post(
       const expose =
         process.env.NODE_ENV === "development" ||
         String(process.env.EXPOSE_CIBIL_ERRORS || "").trim() === "1";
+      const userFacing = String(err?.message || err || "").trim();
 
       return res.status(status).json({
         ok: false,
         source: "server",
-        error: "Failed to verify payment or fetch CIBIL",
-        ...(expose && { details: String(err?.message || err) }),
+        error:
+          userFacing ||
+          "Failed to verify payment or fetch CIBIL",
+        ...(expose && { details: String(err?.stack || err) }),
       });
     }
   }
@@ -1182,7 +1059,16 @@ router.post(
 
 router.post("/razorpay/retry-cibil", async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, name, mobile, pan } = req.body;
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      name,
+      mobile,
+      pan,
+      gender: genderBody,
+      report_kind: reportKindBody,
+      reportKind: reportKindAlt,
+    } = req.body;
     if (!razorpay_order_id && !razorpay_payment_id) {
       return res.status(400).json({
         ok: false,
@@ -1202,31 +1088,107 @@ router.post("/razorpay/retry-cibil", async (req, res) => {
     }
 
     const resolvedName = name || payment.customer_name;
-    const resolvedMobile = String(mobile || payment.mobile || "");
+    const mobileStr = String(mobile || payment.mobile || "")
+      .replace(/\D/g, "")
+      .slice(-10);
     const resolvedPan = String(pan || payment.metadata?.pan || "").toUpperCase();
 
-    if (!resolvedName || !resolvedMobile || !resolvedPan) {
+    if (!resolvedName || !mobileStr || !resolvedPan) {
       return res.status(400).json({
         ok: false,
         error: "name, mobile and pan are required to retry CIBIL",
       });
     }
 
+    const productKind = resolveProductReportKind({
+      fromSession: null,
+      fromPaymentMetadata: payment.metadata?.cibil_report_kind,
+      fromClient: reportKindBody || reportKindAlt,
+    });
+    const isCibilCredit = productKind === "cibil_credit_report";
+    const gender = normalizeGenderInput(genderBody) || "male";
+
     try {
-      const surepassResult = await callSurepassCibil({
-        name: resolvedName,
-        mobile: resolvedMobile,
-        pan: resolvedPan,
-      });
+      let pdfRes;
+      if (isCibilCredit) {
+        pdfRes = await fetchCibilCreditReportPdfFromSurepass({
+          name: resolvedName,
+          mobileStr,
+          panStr: resolvedPan,
+          gender,
+          consent: "Y",
+        });
+      } else {
+        pdfRes = await fetchExperianPdfLinkFromSurepass({
+          name: resolvedName,
+          mobileStr,
+          panStr: resolvedPan,
+          consent: "Y",
+        });
+      }
+
+      if (!pdfRes.ok) {
+        await Payment.updateOne(
+          { _id: payment._id },
+          {
+            $set: {
+              status: "paid_pending",
+              "metadata.cibil_status": "pending",
+              "metadata.cibil_last_attempt_at": new Date(),
+              "metadata.cibil_last_error": {
+                message: pdfRes.error,
+                status: pdfRes.status ?? null,
+              },
+            },
+          }
+        );
+        return res.status(202).json({
+          ok: true,
+          cibil_status: "pending",
+          message: pdfRes.error || "Could not fetch report PDF. Retry shortly.",
+          razorpay_order_id: payment.razorpay_order_id,
+          razorpay_payment_id: payment.razorpay_payment_id,
+        });
+      }
+
+      const rawKey = isCibilCredit
+        ? "cibil_credit_report_pdf"
+        : "experian_credit_report_pdf";
+      const mergedRaw = { [rawKey]: pdfRes.data?.data || pdfRes.data };
+      const score = pdfRes.creditScore;
+      const block = pdfRes.data?.data || pdfRes.data;
+      const finalScore =
+        score != null
+          ? score
+          : toNumberOrNull(
+              block?.credit_score ?? block?.cibil_score ?? block?.score
+            );
 
       await saveCibilResult({
         paymentId: payment.razorpay_payment_id || payment.razorpay_order_id,
         customerName: resolvedName,
-        mobile: resolvedMobile,
+        mobile: mobileStr,
         pan: resolvedPan,
-        cibilScore: surepassResult.cibilScore,
-        rawResponse: surepassResult.providerRaw,
+        cibilScore: finalScore,
+        rawResponse: mergedRaw,
       });
+
+      let creditReportUrl = null;
+      if (pdfRes.link) {
+        const stored = await downloadExperianPdfToLocalDisk(pdfRes.link);
+        if (stored) {
+          await updateLatestCibilPdfFields(mobileStr, resolvedPan, {
+            experian_pdf_link: pdfRes.link,
+            cibil_pdf_report_url: stored,
+          });
+          creditReportUrl = publicFileAbsoluteUrl(req, stored);
+        } else {
+          await updateLatestCibilPdfFields(mobileStr, resolvedPan, {
+            experian_pdf_link: pdfRes.link,
+          });
+          creditReportUrl = publicFileAbsoluteUrl(req, pdfRes.link);
+        }
+      }
 
       await Payment.updateOne(
         { _id: payment._id },
@@ -1234,7 +1196,7 @@ router.post("/razorpay/retry-cibil", async (req, res) => {
           $set: {
             status: "paid",
             customer_name: resolvedName,
-            mobile: resolvedMobile,
+            mobile: mobileStr,
             "metadata.pan": resolvedPan,
             "metadata.cibil_status": "success",
             "metadata.cibil_last_error": null,
@@ -1246,11 +1208,10 @@ router.post("/razorpay/retry-cibil", async (req, res) => {
       return res.json({
         ok: true,
         cibil_status: "success",
-        score: surepassResult.cibilScore,
-        report_number: surepassResult.reportNumber,
-        report_date: surepassResult.reportDate,
-        report_time: surepassResult.reportTime,
-        raw: surepassResult.providerRaw,
+        report_kind: productKind,
+        score: finalScore,
+        raw: mergedRaw,
+        credit_report_link: creditReportUrl,
       });
     } catch (spErr) {
       await Payment.updateOne(
@@ -1259,13 +1220,13 @@ router.post("/razorpay/retry-cibil", async (req, res) => {
           $set: {
             status: "paid_pending",
             customer_name: resolvedName,
-            mobile: resolvedMobile,
+            mobile: mobileStr,
             "metadata.pan": resolvedPan,
             "metadata.cibil_status": "pending",
             "metadata.cibil_last_attempt_at": new Date(),
             "metadata.cibil_last_error": {
               message: spErr?.message || "Surepass error",
-              status: spErr?.providerStatus || null,
+              status: spErr?.response?.status || null,
             },
           },
         }
@@ -1339,65 +1300,20 @@ router.post("/experian-pdf", async (req, res) => {
     let providerLink = latest?.experian_pdf_link || null;
 
     if (!providerLink) {
-      let spRes;
-      try {
-        spRes = await axios.post(
-          SUREPASS_PDF_ENDPOINT,
-          { name, consent: consent || "Y", mobile: mobileStr, pan: panStr },
-          {
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${SUREPASS_TOKEN}`,
-            },
-            timeout: 45000,
-            validateStatus: () => true,
-          }
-        );
-      } catch {
-        spRes = await axios.post(
-          SUREPASS_PDF_ENDPOINT,
-          { name, consent: consent || "Y", mobile: mobileStr, pan: panStr },
-          {
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${SUREPASS_TOKEN}`,
-            },
-            timeout: 45000,
-            validateStatus: () => true,
-          }
-        );
-      }
-
-      if (spRes.status < 200 || spRes.status >= 300) {
-        const msg =
-          spRes.data?.message ||
-          spRes.data?.error ||
-          "Surepass PDF API failed";
+      const pdfRes = await fetchExperianPdfLinkFromSurepass({
+        name,
+        mobileStr,
+        panStr,
+        consent: consent || "Y",
+      });
+      if (!pdfRes.ok) {
         return res.status(502).json({
           ok: false,
-          error: msg,
-          provider_status: spRes.status,
+          error: pdfRes.error || "Surepass PDF API failed",
+          provider_status: pdfRes.status,
         });
       }
-
-      providerLink =
-        spRes.data?.data?.credit_report_link ||
-        spRes.data?.data?.report_url ||
-        spRes.data?.credit_report_link;
-
-      if (!providerLink) {
-        console.error(
-          "experian-pdf: no link in Surepass body",
-          JSON.stringify(spRes.data)?.slice(0, 500)
-        );
-        return res.status(502).json({
-          ok: false,
-          error:
-            spRes.data?.message ||
-            "No PDF link in provider response. Try again later.",
-        });
-      }
-
+      providerLink = pdfRes.link;
       await updateLatestCibilPdfFields(mobileStr, panStr, {
         experian_pdf_link: providerLink,
       });

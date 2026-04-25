@@ -160,6 +160,18 @@ export const listCibilChecks = asyncHandler(async (req, res) => {
     if (req.query.min_score) q.cibil_score.$gte = Number(req.query.min_score);
     if (req.query.max_score) q.cibil_score.$lte = Number(req.query.max_score);
   }
+  if (req.query.from_date || req.query.to_date) {
+    q.checked_at = {};
+    if (req.query.from_date) {
+      const from = new Date(`${String(req.query.from_date)}T00:00:00.000`);
+      if (!Number.isNaN(from.getTime())) q.checked_at.$gte = from;
+    }
+    if (req.query.to_date) {
+      const to = new Date(`${String(req.query.to_date)}T23:59:59.999`);
+      if (!Number.isNaN(to.getTime())) q.checked_at.$lte = to;
+    }
+    if (!q.checked_at.$gte && !q.checked_at.$lte) delete q.checked_at;
+  }
 
   const { page, per_page, skip, limit } = parsePagination(req.query);
   const [items, total] = await Promise.all([

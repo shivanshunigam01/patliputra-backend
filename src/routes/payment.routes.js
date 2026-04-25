@@ -649,6 +649,10 @@ async function commitCibilFromPrecheckSession(
    Step 0: Pre-check (form validation only — no Surepass call until after payment)
 ========================= */
 router.post("/cibil-precheck", async (req, res) => {
+  return res.status(503).json({
+    ok: false,
+    error: "CIBIL API is disabled.",
+  });
   try {
     const {
       name,
@@ -748,6 +752,10 @@ router.post("/cibil-precheck", async (req, res) => {
    Step 1: Create Razorpay order (amount from precheck report kind)
 ========================= */
 router.post("/razorpay/order", async (req, res) => {
+  return res.status(503).json({
+    ok: false,
+    error: "CIBIL API is disabled.",
+  });
   try {
     const { precheck_id: precheckId } = req.body || {};
 
@@ -815,6 +823,13 @@ function unlinkUpload(filePath) {
   }
 }
 
+router.post("/razorpay/verify-cibil", (_req, res) => {
+  return res.status(503).json({
+    ok: false,
+    error: "CIBIL API is disabled.",
+  });
+});
+
 router.post(
   "/razorpay/verify-cibil",
   (req, res, next) => {
@@ -835,6 +850,10 @@ router.post(
     });
   },
   async (req, res) => {
+    return res.status(503).json({
+      ok: false,
+      error: "CIBIL API is disabled.",
+    });
     let uploadedPath = null;
     try {
       const {
@@ -1058,6 +1077,10 @@ router.post(
 );
 
 router.post("/razorpay/retry-cibil", async (req, res) => {
+  return res.status(503).json({
+    ok: false,
+    error: "CIBIL API is disabled.",
+  });
   try {
     const {
       razorpay_order_id,
@@ -1266,6 +1289,14 @@ router.post("/experian-pdf", async (req, res) => {
 
     const mobileStr = String(mobile).replace(/\D/g, "").slice(-10);
     const panStr = String(pan).toUpperCase();
+    const maskedMobile =
+      mobileStr.length >= 10 ? `${mobileStr.slice(0, 2)}******${mobileStr.slice(-2)}` : "invalid";
+    const maskedPan = panStr.length >= 10 ? `${panStr.slice(0, 2)}******${panStr.slice(-2)}` : "invalid";
+    console.log("[experian-pdf] request received", {
+      name: String(name).trim(),
+      mobile: maskedMobile,
+      pan: maskedPan,
+    });
 
     if (!/^\d{10}$/.test(mobileStr)) {
       return res
@@ -1279,61 +1310,79 @@ router.post("/experian-pdf", async (req, res) => {
         .json({ ok: false, error: "PAN format invalid (ABCDE1234F)" });
     }
 
-    const panMasked = maskPan(panStr);
+    const pdfRes = await fetchExperianPdfLinkFromSurepass({
+      name: String(name).trim(),
+      mobileStr,
+      panStr,
+      consent: consent || "Y",
+    });
+    console.log("[experian-pdf] provider response", {
+      ok: pdfRes.ok,
+      status: pdfRes.status ?? null,
+      hasLink: !!pdfRes.link,
+      providerMessage: !pdfRes.ok ? pdfRes.error : null,
+    });
+    if (!pdfRes.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: pdfRes.error || "Surepass PDF API failed",
+        provider_status: pdfRes.status,
+      });
+    }
 
-    const latest = await CibilCheck.findOne({
+    const providerLink = pdfRes.link;
+    const block = pdfRes.data?.data || pdfRes.data;
+    const score =
+      pdfRes.creditScore != null
+        ? pdfRes.creditScore
+        : toNumberOrNull(
+            block?.credit_score ?? block?.cibil_score ?? block?.score
+          );
+    const paymentId = `direct_experian_${Date.now()}_${crypto
+      .randomBytes(4)
+      .toString("hex")}`;
+
+    await saveCibilResult({
+      paymentId,
+      customerName: String(name).trim(),
       mobile: mobileStr,
-      $or: [{ pan: panStr }, { pan_masked: panMasked }],
-    }).sort({ checked_at: -1 });
-
-    if (latest?.cibil_pdf_report_url) {
-      return res.json({
-        ok: true,
-        credit_report_link: publicFileAbsoluteUrl(
-          req,
-          latest.cibil_pdf_report_url
-        ),
-        cached: true,
-      });
-    }
-
-    let providerLink = latest?.experian_pdf_link || null;
-
-    if (!providerLink) {
-      const pdfRes = await fetchExperianPdfLinkFromSurepass({
-        name,
-        mobileStr,
-        panStr,
-        consent: consent || "Y",
-      });
-      if (!pdfRes.ok) {
-        return res.status(502).json({
-          ok: false,
-          error: pdfRes.error || "Surepass PDF API failed",
-          provider_status: pdfRes.status,
-        });
-      }
-      providerLink = pdfRes.link;
-      await updateLatestCibilPdfFields(mobileStr, panStr, {
-        experian_pdf_link: providerLink,
-      });
-    }
+      pan: panStr,
+      cibilScore: score,
+      rawResponse: { experian_credit_report_pdf: block || pdfRes.data },
+    });
 
     const storedPath = await downloadExperianPdfToLocalDisk(providerLink);
     if (storedPath) {
-      await updateLatestCibilPdfFields(mobileStr, panStr, {
-        experian_pdf_link: providerLink,
-        cibil_pdf_report_url: storedPath,
-      });
+      console.log("[experian-pdf] pdf stored locally", { storedPath });
+      await CibilCheck.updateOne(
+        { payment_id: paymentId },
+        {
+          $set: {
+            experian_pdf_link: providerLink,
+            cibil_pdf_report_url: storedPath,
+          },
+        }
+      );
       return res.json({
         ok: true,
+        score,
         credit_report_link: publicFileAbsoluteUrl(req, storedPath),
         cached: false,
       });
     }
 
+    await CibilCheck.updateOne(
+      { payment_id: paymentId },
+      {
+        $set: {
+          experian_pdf_link: providerLink,
+        },
+      }
+    );
+    console.log("[experian-pdf] using provider link directly");
     return res.json({
       ok: true,
+      score,
       credit_report_link: publicFileAbsoluteUrl(req, providerLink),
       cached: false,
       upload_note: "local_copy_unavailable",
@@ -1346,6 +1395,10 @@ router.post("/experian-pdf", async (req, res) => {
 
 /* POST /payments/cibil-credit-pdf — CIBIL Credit Report PDF (bureau) – same as Surepass product after payment */
 router.post("/cibil-credit-pdf", async (req, res) => {
+  return res.status(503).json({
+    ok: false,
+    error: "CIBIL API is disabled.",
+  });
   try {
     const { name, mobile, pan, gender = "male", consent = "Y" } = req.body;
 
@@ -1407,7 +1460,7 @@ router.post("/cibil-credit-pdf", async (req, res) => {
 
     const providerLink = pdfRes.link;
     await updateLatestCibilPdfFields(mobileStr, panStr, {
-      experian_pdf_link: providerLink,
+        experian_pdf_link: providerLink,
     });
 
     const storedPath = await downloadExperianPdfToLocalDisk(providerLink);

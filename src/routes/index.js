@@ -27,6 +27,7 @@ import paymentPageRoutes from "../routes/payment.routes.js";
 import cibilSyncRoutes from "./modules/cibilSync.routes.js";
 import careerRoutes from "../routes/careerRoutes.js";
 import timelineRoutes from "../routes/timelineRoutes.js";
+import serviceKitEnquiryRoutes from "./serviceKitEnquiryRoutes.js";
 
 
 
@@ -66,6 +67,7 @@ router.use("/settings", settingsRoutes);
 router.use("/media", mediaRoutes);
 router.use("/cibil", cibilRoutes);
 router.use("/timeline", timelineRoutes);
+router.use("/service-kit-enquiries", serviceKitEnquiryRoutes);
 
 
 export default router;

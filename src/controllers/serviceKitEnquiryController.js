@@ -1,5 +1,5 @@
 import { ServiceKitEnquiry } from "../models/ServiceKitEnquiry.js";
-import { getKitById } from "../data/jcbServiceKits.js";
+import { getKitById, JCB_SERVICE_KITS } from "../data/jcbServiceKits.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { ok, created, fail } from "../utils/apiResponse.js";
 
@@ -30,7 +30,6 @@ function mapEnquiry(doc) {
 }
 
 export const listServiceKits = asyncHandler(async (_req, res) => {
-  const { JCB_SERVICE_KITS } = await import("../data/jcbServiceKits.js");
   return ok(res, JCB_SERVICE_KITS);
 });
 

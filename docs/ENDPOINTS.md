@@ -88,3 +88,15 @@ Analytics
 - POST /v1/analytics/comparison (public)
 - GET /v1/analytics/comparisons (admin)
 
+SEO (Month 1 architecture)
+- GET /seo/districts (public) — 38 Bihar districts
+- GET /seo/categories (public) — JCB, Ashok Leyland, Switch, Used JCB
+- GET /seo/keywords (public) — keyword map by category
+- GET /seo/faqs/:category (public) — Hinglish FAQs
+- GET /seo/pages (public) — list district landing pages
+- GET /seo/pages/:category/:district (public) — single hyperlocal page
+- GET /seo/architecture (public) — URL layer map
+- GET /seo/sitemap.xml (public) — XML sitemap including 152 district URLs
+
+Seed: `npm run seed:seo`
+

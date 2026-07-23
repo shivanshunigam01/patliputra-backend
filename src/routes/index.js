@@ -28,13 +28,10 @@ import cibilSyncRoutes from "./modules/cibilSync.routes.js";
 import careerRoutes from "../routes/careerRoutes.js";
 import timelineRoutes from "../routes/timelineRoutes.js";
 import serviceKitEnquiryRoutes from "./serviceKitEnquiryRoutes.js";
-
-
-
-
-
+import seoRoutes from "./modules/seoRoutes.js";
 
 const router = Router();
+router.use("/seo", seoRoutes);
 router.use("/products", productMediaRoutes);
 router.use("/dealers", dealerRoutes);
 router.use("/users", userRoutes);

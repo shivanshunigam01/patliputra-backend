@@ -1,0 +1,105 @@
+/** SEO category layers aligned with product ecosystems */
+export const SEO_CATEGORIES = {
+  jcb: {
+    slug: "jcb",
+    brand: "JCB",
+    name: "JCB",
+    nameHi: "जेसीबी",
+    hubPath: "/jcb",
+    productBrand: "JCB",
+    tagline: "Construction Equipment",
+    taglineHi: "निर्माण मशीनरी",
+    primaryKeywords: [
+      "JCB Price Bihar",
+      "JCB Dealer Bihar",
+      "JCB Machine",
+      "JCB Excavator",
+      "Backhoe Loader",
+      "JCB 3DX",
+      "JCB on EMI",
+      "JCB Finance",
+      "JCB Service",
+      "Used JCB",
+    ],
+    subcategories: [
+      { slug: "backhoe-loader", name: "Backhoe Loader", nameHi: "बैकहो लोडर" },
+      { slug: "excavator", name: "Excavator", nameHi: "एक्सकेवेटर" },
+      { slug: "telehandler", name: "Telehandler", nameHi: "टेलीहैंडलर" },
+      { slug: "skid-steer", name: "Skid Steer", nameHi: "स्किड स्टियर" },
+      { slug: "compactor", name: "Compactor", nameHi: "कॉम्पेक्टर" },
+      { slug: "wheel-loader", name: "Wheel Loader", nameHi: "व्हील लोडर" },
+    ],
+  },
+  "ashok-leyland": {
+    slug: "ashok-leyland",
+    brand: "Ashok Leyland",
+    name: "Ashok Leyland",
+    nameHi: "अशोक लेलैंड",
+    hubPath: "/ashok-leyland",
+    productBrand: "Ashok Leyland",
+    tagline: "Trucks & Commercial Vehicles",
+    taglineHi: "ट्रक और कमर्शियल वाहन",
+    primaryKeywords: [
+      "Ashok Leyland Truck",
+      "Ashok Leyland Bihar",
+      "Ashok Leyland Dealer",
+      "Ashok Leyland Price",
+      "Truck Finance",
+      "Truck EMI",
+    ],
+    subcategories: [
+      { slug: "trucks", name: "Trucks", nameHi: "ट्रक" },
+      { slug: "tippers", name: "Tippers", nameHi: "टिपर" },
+      { slug: "buses", name: "Buses", nameHi: "बस" },
+      { slug: "lcv", name: "LCV", nameHi: "एलसीवी" },
+      { slug: "icv", name: "ICV", nameHi: "आईसीवी" },
+      { slug: "hcv", name: "HCV", nameHi: "एचसीवी" },
+    ],
+  },
+  switch: {
+    slug: "switch",
+    brand: "Switch Mobility",
+    name: "Switch Mobility",
+    nameHi: "स्विच मोबिलिटी",
+    hubPath: "/switch-ev",
+    productBrand: "Switch",
+    tagline: "Electric Commercial Vehicles",
+    taglineHi: "इलेक्ट्रिक कमर्शियल वाहन",
+    primaryKeywords: [
+      "Electric Bus",
+      "EV Bus Bihar",
+      "Electric Commercial Vehicle",
+      "Electric Fleet",
+      "Electric LCV",
+    ],
+    subcategories: [
+      { slug: "electric-bus", name: "Electric Bus", nameHi: "इलेक्ट्रिक बस" },
+      { slug: "electric-lcv", name: "Electric LCV", nameHi: "इलेक्ट्रिक एलसीवी" },
+    ],
+  },
+  "used-jcb": {
+    slug: "used-jcb",
+    brand: "Used Machines",
+    name: "Used JCB & Equipment",
+    nameHi: "यूज़्ड जेसीबी और मशीनें",
+    hubPath: "/used-vehicles",
+    productBrand: "Used",
+    tagline: "Certified Pre-owned Machines",
+    taglineHi: "सर्टिफाइड प्री-ओन्ड मशीनें",
+    primaryKeywords: [
+      "Used JCB Bihar",
+      "Second Hand JCB",
+      "Used Excavator",
+      "Used Tipper",
+      "Used Truck",
+      "Certified Used Machine",
+    ],
+    subcategories: [],
+  },
+};
+
+export const SEO_CATEGORY_SLUGS = Object.keys(SEO_CATEGORIES);
+
+export function getSeoCategory(slug) {
+  return SEO_CATEGORIES[slug] || null;
+}

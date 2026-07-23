@@ -8,7 +8,8 @@
     "dev": "nodemon server.js",
     "start": "node server.js",
     "lint": "eslint .",
-    "seed:admin": "node src/scripts/seedAdmin.js"
+    "seed:admin": "node src/scripts/createMasterAdmin.js",
+    "seed:seo": "node src/scripts/seedSeoPages.js"
   },
   "engines": {
     "node": ">=18.0.0"
